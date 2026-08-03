@@ -44,7 +44,11 @@ fi
 pkg_install(){
   echo -e "${C}安装 $1 中...${N}"
   case "$FAMILY" in
-    debian) apt-get update && apt-get install -y "$1" ;;
+    debian)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update || echo -e "${Y}⚠ apt update 有源报错（见上方），忽略并继续尝试安装${N}"
+      apt-get install -y "$1"
+      ;;
     alpine) apk add --no-cache "$1" ;;
     rhel)   command -v dnf >/dev/null && dnf install -y "$1" || yum install -y "$1" ;;
     *) echo -e "${R}未知系统，无法自动安装 $1${N}"; return 1 ;;
