@@ -1,6 +1,5 @@
 #!/bin/bash
 # 自用脚本，擅自使用后果自负
-# ── 若无 bash 则尝试自动安装后重入（Alpine）──
 if [ -z "$BASH_VERSION" ]; then
   if command -v bash >/dev/null 2>&1; then exec bash "$0" "$@"; fi
   echo "未检测到 bash，尝试安装..."
@@ -18,7 +17,6 @@ G="\033[32m"; R="\033[31m"; Y="\033[33m"; C="\033[36m"; N="\033[0m"
 
 [ "$(id -u)" != "0" ] && { echo -e "${R}请用 root 运行${N}"; exit 1; }
 
-# ══════════ 系统检测层 ══════════
 OSID="unknown"; OSLIKE=""
 [ -f /etc/os-release ] && . /etc/os-release && OSID="$ID" && OSLIKE="$ID_LIKE"
 
@@ -29,7 +27,6 @@ case "$OSID$OSLIKE" in
   *) FAMILY="unknown" ;;
 esac
 
-# 初始化管理器：INIT=systemd / openrc
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   INIT="systemd"
 elif command -v rc-service >/dev/null 2>&1; then
@@ -38,7 +35,6 @@ else
   INIT="unknown"
 fi
 
-# sshd 服务名
 if [ "$INIT" = "systemd" ]; then
   systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service' && SSHSVC="ssh" || SSHSVC="sshd"
 else
@@ -54,10 +50,10 @@ pkg_install(){
     *) echo -e "${R}未知系统，无法自动安装 $1${N}"; return 1 ;;
   esac
 }
-svc_restart(){ [ "$INIT" = "openrc" ] && rc-service "$1" restart || systemctl restart "$1"; }
-svc_enable(){  [ "$INIT" = "openrc" ] && { rc-update add "$1" default; rc-service "$1" start; } || systemctl enable --now "$1"; }
-svc_disable(){ [ "$INIT" = "openrc" ] && { rc-service "$1" stop; rc-update del "$1" default; } || systemctl disable --now "$1"; }
-svc_active(){  [ "$INIT" = "openrc" ] && rc-service "$1" status >/dev/null 2>&1 || systemctl is-active --quiet "$1" 2>/dev/null; }
+svc_restart(){ if [ "$INIT" = "openrc" ]; then rc-service "$1" restart; else systemctl restart "$1"; fi; }
+svc_enable(){  if [ "$INIT" = "openrc" ]; then rc-update add "$1" default; rc-service "$1" start; else systemctl enable --now "$1"; fi; }
+svc_disable(){ if [ "$INIT" = "openrc" ]; then rc-service "$1" stop; rc-update del "$1" default; else systemctl disable --now "$1"; fi; }
+svc_active(){  if [ "$INIT" = "openrc" ]; then rc-service "$1" status >/dev/null 2>&1; else systemctl is-active --quiet "$1" 2>/dev/null; fi; }
 port_used(){
   if command -v ss >/dev/null 2>&1; then ss -tln | grep -q ":$1 "
   else netstat -tln 2>/dev/null | grep -q ":$1 "; fi
@@ -67,7 +63,6 @@ set_hostname(){
   else echo "$1" > /etc/hostname; hostname "$1"; fi
 }
 
-# ── 确保 sshd_config.d 生效（部分系统无 Include）──
 mkdir -p "$SSHDIR"
 if ! grep -qiE "^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/" /etc/ssh/sshd_config; then
   echo -e "${Y}⚠ 主配置无 Include，已自动插入到首行${N}"
@@ -75,7 +70,6 @@ if ! grep -qiE "^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/" /etc/s
 fi
 touch "$CONF"
 
-# ══════════ 核心功能 ══════════
 cur_port(){ sshd -T 2>/dev/null | awk '/^port /{print $2; exit}'; }
 has_key(){ [ -f "$AK" ] && grep -qF "$PUBKEY" "$AK"; }
 pw_on(){ sshd -T 2>/dev/null | grep -q '^passwordauthentication yes'; }
@@ -132,7 +126,7 @@ key_del(){
 f2b_logpath(){
   if [ "$INIT" = "systemd" ]; then echo "systemd"
   elif [ -f /var/log/auth.log ]; then echo "/var/log/auth.log"
-  elif [ -f /var/log/secure" ]; then echo "/var/log/secure"
+  elif [ -f /var/log/secure ]; then echo "/var/log/secure"
   elif [ -f /var/log/messages ]; then echo "/var/log/messages"
   else echo "none"; fi
 }
@@ -140,6 +134,7 @@ f2b_add(){
   command -v fail2ban-server >/dev/null 2>&1 || pkg_install fail2ban || return 1
   mkdir -p /etc/fail2ban/jail.d
   local lp; lp=$(f2b_logpath)
+  local BACKLINE
   if [ "$lp" = "systemd" ]; then
     BACKLINE="backend  = systemd"
   elif [ "$lp" = "none" ]; then
@@ -214,7 +209,7 @@ f2b_on   && echo -e "   防爆破      : ${G}✅ 已开启${N} (60s/5次封1分�
 pw_on    && echo -e "   仅密钥登录  : ${R}❌ 密码登录开启中${N}" || echo -e "   仅密钥登录  : ${G}✅ 已开启${N}"
 echo -e "   SSH 端口    : ${C}$(cur_port)${N}"
 echo -e "   主机名      : ${C}$(hostname)${N}"
-echo -e "   系统        : ${C}$OSID${N} / 家族 ${C}$FAMILY${N} / 初始化 ${C}$INIT${N}"
+echo -e "   系统        : ${C}$OSID${N} / ${C}$FAMILY${N} / ${C}$INIT${N}"
 echo "  ═══════════════════════════════════════════"
 echo "   1、默认全开（注入公钥+防爆破+仅密钥登录）"
 echo "   2、注入公钥          （再次执行则关闭）"
