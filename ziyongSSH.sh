@@ -108,11 +108,32 @@ apply(){
 }
 
 key_add(){
-  mkdir -p /root/.ssh; chmod 700 /root/.ssh; touch "$AK"
-  has_key || echo "$PUBKEY" >> "$AK"
+  if ! mkdir -p /root/.ssh 2>/tmp/.ke.$$; then
+    echo -e "${R}✘ 无法创建 /root/.ssh 目录，报错：${N}"; cat /tmp/.ke.$$; rm -f /tmp/.ke.$$; return 1
+  fi
+  chmod 700 /root/.ssh
+  if ! touch "$AK" 2>/tmp/.ke.$$; then
+    echo -e "${R}✘ 无法创建 $AK ，报错：${N}"; cat /tmp/.ke.$$; rm -f /tmp/.ke.$$; return 1
+  fi
+  if ! has_key; then
+    if ! echo "$PUBKEY" >> "$AK" 2>/tmp/.ke.$$; then
+      echo -e "${R}✘ 写入公钥失败，报错：${N}"; cat /tmp/.ke.$$; rm -f /tmp/.ke.$$
+      echo -e "${Y}  磁盘：$(df -h /root 2>&1 | tail -1)${N}"
+      echo -e "${Y}  属性：$(lsattr "$AK" 2>&1)${N}"
+      return 1
+    fi
+  fi
+  rm -f /tmp/.ke.$$
   sed -i '/^$/d' "$AK"; chmod 600 "$AK"
+  if ! has_key; then
+    echo -e "${R}✘ 校验失败：公钥没有出现在 $AK 里${N}"
+    echo -e "${Y}  脚本内 PUBKEY：${N}$PUBKEY"
+    echo -e "${Y}  文件实际内容：${N}"; cat "$AK" 2>&1
+    return 1
+  fi
   setc PubkeyAuthentication yes
-  echo -e "${G}✔ 公钥已注入${N}"
+  echo -e "${G}✔ 公钥已注入并校验通过${N}"
+  return 0
 }
 key_del(){
   if pw_on; then
@@ -163,16 +184,26 @@ F2BEOF
     echo -e "${R}✘ fail2ban 启动失败，错误如下：${N}"
     if [ "$INIT" = "systemd" ]; then journalctl -u fail2ban -n 20 --no-pager
     else tail -20 /var/log/fail2ban.log 2>/dev/null || echo "无日志"; fi
+    return 1
   fi
 }
 f2b_del(){ svc_disable fail2ban; rm -f "$F2B"; echo -e "${Y}✔ 防爆破已关闭${N}"; }
 
 keyonly_on(){
-  key_add
+  if ! key_add; then
+    echo -e "${R}✘ 已中止：公钥注入失败，不会关闭密码登录${N}"
+    echo -e "${Y}  当前登录方式保持不变，不存在锁死风险${N}"
+    return 1
+  fi
   setc PasswordAuthentication no
   setc PermitRootLogin prohibit-password
   apply
-  echo -e "${G}已切换为仅密钥登录${N}"
+  if sshd -T 2>/dev/null | grep -q '^pubkeyauthentication yes'; then
+    echo -e "${G}已切换为仅密钥登录${N}"
+  else
+    echo -e "${R}✘ 危险：生效配置里 PubkeyAuthentication 不是 yes，正在回滚密码登录${N}"
+    setc PasswordAuthentication yes; setc PermitRootLogin yes; apply
+  fi
 }
 keyonly_off(){
   setc PasswordAuthentication yes
@@ -223,13 +254,25 @@ echo "  ════════════════════════
 [ "$FAMILY" = "unknown" ] && echo -e "${Y}  ⚠ 未识别的系统，功能可能不完整${N}"
 }
 
-while true; do
-  status
-  read -rp "  请选择 [回车=1]: " op
-  op=${op:-1}
-  case "$op" in
-    1) key_add; f2b_add; setc PasswordAuthentication no; setc PermitRootLogin prohibit-password; apply ;;
-    2) if has_key; then key_del; else key_add; apply; fi ;;
+run_op(){
+  case "$1" in
+    1) if key_add; then
+         f2b_add || echo -e "${Y}⚠ 防爆破配置失败（不影响登录），继续${N}"
+         setc PasswordAuthentication no
+         setc PermitRootLogin prohibit-password
+         apply
+         if sshd -T 2>/dev/null | grep -q '^pubkeyauthentication yes'; then
+           echo -e "${G}✔ 全部完成${N}"
+         else
+           echo -e "${R}✘ 危险：生效配置里 PubkeyAuthentication 不是 yes，正在回滚密码登录${N}"
+           setc PasswordAuthentication yes; setc PermitRootLogin yes; apply
+         fi
+       else
+         echo -e "${R}✘ 已中止：公钥注入失败，已跳过「关闭密码登录」${N}"
+         echo -e "${Y}  密码登录保持可用，不会锁死，请按上方报错排查后重试${N}"
+         return 1
+       fi ;;
+    2) if has_key; then key_del; else key_add && apply; fi ;;
     3) if f2b_on; then f2b_del; else f2b_add; fi ;;
     4) if pw_on; then keyonly_on; else keyonly_off; fi ;;
     5) set_port ;;
@@ -242,7 +285,26 @@ while true; do
        fi ;;
     7) passwd root ;;
     0) exit 0 ;;
-    *) echo -e "${R}无效选项${N}" ;;
+    *) echo -e "${R}无效选项${N}"; return 1 ;;
   esac
+}
+
+# ── 参数模式：带参数直接执行后退出 ──
+if [ -n "$1" ]; then
+  echo -e "${C}非交互模式，执行选项 $1${N}"
+  run_op "$1"; rc=$?
+  echo -e "${C}══ 执行完毕，当前状态 ══${N}"
+  has_key && echo -e "   公钥注入    : ${G}✅ 已部署${N}" || echo -e "   公钥注入    : ${R}❌ 未部署${N}"
+  f2b_on   && echo -e "   防爆破      : ${G}✅ 已开启${N}" || echo -e "   防爆破      : ${R}❌ 未开启${N}"
+  pw_on    && echo -e "   仅密钥登录  : ${R}❌ 密码登录开启中${N}" || echo -e "   仅密钥登录  : ${G}✅ 已开启${N}"
+  echo -e "   SSH 端口    : ${C}$(cur_port)${N}"
+  exit $rc
+fi
+
+while true; do
+  status
+  read -rp "  请选择 [回车=1]: " op
+  op=${op:-1}
+  run_op "$op"
   read -rp "  回车继续..." _
 done
