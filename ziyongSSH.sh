@@ -1,1 +1,253 @@
+#!/bin/bash
+# 自用脚本，擅自使用后果自负
+# ── 若无 bash 则尝试自动安装后重入（Alpine）──
+if [ -z "$BASH_VERSION" ]; then
+  if command -v bash >/dev/null 2>&1; then exec bash "$0" "$@"; fi
+  echo "未检测到 bash，尝试安装..."
+  if command -v apk >/dev/null 2>&1; then apk add --no-cache bash && exec bash "$0" "$@"; fi
+  echo "安装 bash 失败，请手动安装后重试"; exit 1
+fi
 
+PUBKEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKkSf1uHPsLHRYVWPJ73yrEX5fU6FTIJEEwvBb4MD3Q7"
+SSHDIR="/etc/ssh/sshd_config.d"
+CONF="$SSHDIR/00-hardening.conf"
+PORTCONF="$SSHDIR/01-port.conf"
+AK="/root/.ssh/authorized_keys"
+F2B="/etc/fail2ban/jail.d/00-sshd-custom.conf"
+G="\033[32m"; R="\033[31m"; Y="\033[33m"; C="\033[36m"; N="\033[0m"
+
+[ "$(id -u)" != "0" ] && { echo -e "${R}请用 root 运行${N}"; exit 1; }
+
+# ══════════ 系统检测层 ══════════
+OSID="unknown"; OSLIKE=""
+[ -f /etc/os-release ] && . /etc/os-release && OSID="$ID" && OSLIKE="$ID_LIKE"
+
+case "$OSID$OSLIKE" in
+  *alpine*) FAMILY="alpine" ;;
+  *debian*|*ubuntu*) FAMILY="debian" ;;
+  *rhel*|*fedora*|*centos*) FAMILY="rhel" ;;
+  *) FAMILY="unknown" ;;
+esac
+
+# 初始化管理器：INIT=systemd / openrc
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+  INIT="systemd"
+elif command -v rc-service >/dev/null 2>&1; then
+  INIT="openrc"
+else
+  INIT="unknown"
+fi
+
+# sshd 服务名
+if [ "$INIT" = "systemd" ]; then
+  systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service' && SSHSVC="ssh" || SSHSVC="sshd"
+else
+  SSHSVC="sshd"
+fi
+
+pkg_install(){
+  echo -e "${C}安装 $1 中...${N}"
+  case "$FAMILY" in
+    debian) apt-get update && apt-get install -y "$1" ;;
+    alpine) apk add --no-cache "$1" ;;
+    rhel)   command -v dnf >/dev/null && dnf install -y "$1" || yum install -y "$1" ;;
+    *) echo -e "${R}未知系统，无法自动安装 $1${N}"; return 1 ;;
+  esac
+}
+svc_restart(){ [ "$INIT" = "openrc" ] && rc-service "$1" restart || systemctl restart "$1"; }
+svc_enable(){  [ "$INIT" = "openrc" ] && { rc-update add "$1" default; rc-service "$1" start; } || systemctl enable --now "$1"; }
+svc_disable(){ [ "$INIT" = "openrc" ] && { rc-service "$1" stop; rc-update del "$1" default; } || systemctl disable --now "$1"; }
+svc_active(){  [ "$INIT" = "openrc" ] && rc-service "$1" status >/dev/null 2>&1 || systemctl is-active --quiet "$1" 2>/dev/null; }
+port_used(){
+  if command -v ss >/dev/null 2>&1; then ss -tln | grep -q ":$1 "
+  else netstat -tln 2>/dev/null | grep -q ":$1 "; fi
+}
+set_hostname(){
+  if command -v hostnamectl >/dev/null 2>&1; then hostnamectl set-hostname "$1"
+  else echo "$1" > /etc/hostname; hostname "$1"; fi
+}
+
+# ── 确保 sshd_config.d 生效（部分系统无 Include）──
+mkdir -p "$SSHDIR"
+if ! grep -qiE "^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/" /etc/ssh/sshd_config; then
+  echo -e "${Y}⚠ 主配置无 Include，已自动插入到首行${N}"
+  sed -i "1i Include /etc/ssh/sshd_config.d/*.conf" /etc/ssh/sshd_config
+fi
+touch "$CONF"
+
+# ══════════ 核心功能 ══════════
+cur_port(){ sshd -T 2>/dev/null | awk '/^port /{print $2; exit}'; }
+has_key(){ [ -f "$AK" ] && grep -qF "$PUBKEY" "$AK"; }
+pw_on(){ sshd -T 2>/dev/null | grep -q '^passwordauthentication yes'; }
+f2b_on(){ svc_active fail2ban; }
+
+purge(){
+  for f in "$SSHDIR"/*.conf /etc/ssh/sshd_config; do
+    [ "$f" = "$CONF" ] && continue
+    [ "$f" = "$PORTCONF" ] && continue
+    [ -f "$f" ] && sed -i -E "s/^[[:space:]]*($1[[:space:]].*)$/#\1/I" "$f"
+  done
+}
+setc(){
+  purge "$1"
+  if grep -qiE "^[[:space:]]*$1[[:space:]]" "$CONF"; then
+    sed -i -E "s|^[[:space:]]*$1[[:space:]].*|$1 $2|I" "$CONF"
+  else
+    echo "$1 $2" >> "$CONF"
+  fi
+}
+apply(){
+  cp "$CONF" /tmp/.hb.$$ 2>/dev/null
+  cp "$PORTCONF" /tmp/.pb.$$ 2>/dev/null
+  if sshd -t; then
+    if svc_restart "$SSHSVC"; then
+      echo -e "${G}✔ 已生效${N}"
+    else
+      echo -e "${R}✘ 重启 $SSHSVC 失败（配置已写入，服务未重载）${N}"
+    fi
+  else
+    echo -e "${R}✘ sshd 配置校验失败，已回滚${N}"
+    cp /tmp/.hb.$$ "$CONF" 2>/dev/null
+    [ -f /tmp/.pb.$$ ] && cp /tmp/.pb.$$ "$PORTCONF" 2>/dev/null
+  fi
+  rm -f /tmp/.hb.$$ /tmp/.pb.$$
+}
+
+key_add(){
+  mkdir -p /root/.ssh; chmod 700 /root/.ssh; touch "$AK"
+  has_key || echo "$PUBKEY" >> "$AK"
+  sed -i '/^$/d' "$AK"; chmod 600 "$AK"
+  setc PubkeyAuthentication yes
+  echo -e "${G}✔ 公钥已注入${N}"
+}
+key_del(){
+  if pw_on; then
+    grep -vF "$PUBKEY" "$AK" > "$AK.t" 2>/dev/null && mv "$AK.t" "$AK" && chmod 600 "$AK"
+    echo -e "${Y}✔ 公钥已撤销${N}"
+  else
+    echo -e "${R}✘ 拒绝：密码登录已关闭，撤销公钥会导致无法登录${N}"
+  fi
+}
+
+f2b_logpath(){
+  if [ "$INIT" = "systemd" ]; then echo "systemd"
+  elif [ -f /var/log/auth.log ]; then echo "/var/log/auth.log"
+  elif [ -f /var/log/secure" ]; then echo "/var/log/secure"
+  elif [ -f /var/log/messages ]; then echo "/var/log/messages"
+  else echo "none"; fi
+}
+f2b_add(){
+  command -v fail2ban-server >/dev/null 2>&1 || pkg_install fail2ban || return 1
+  mkdir -p /etc/fail2ban/jail.d
+  local lp; lp=$(f2b_logpath)
+  if [ "$lp" = "systemd" ]; then
+    BACKLINE="backend  = systemd"
+  elif [ "$lp" = "none" ]; then
+    echo -e "${R}✘ 找不到 SSH 日志文件，fail2ban 无法工作${N}"
+    echo -e "${Y}  请先启用 syslog（Alpine: apk add busybox-openrc && rc-service syslog start）${N}"
+    return 1
+  else
+    BACKLINE="backend  = auto
+logpath  = $lp"
+  fi
+  cat > "$F2B" << F2BEOF
+[sshd]
+enabled  = true
+port     = $(cur_port)
+$BACKLINE
+maxretry = 5
+findtime = 60
+bantime  = 60
+F2BEOF
+  svc_enable fail2ban
+  svc_restart fail2ban
+  sleep 1
+  if f2b_on; then
+    echo -e "${G}✔ 防爆破已开启（60秒5次失败封禁1分钟）${N}"
+  else
+    echo -e "${R}✘ fail2ban 启动失败，错误如下：${N}"
+    if [ "$INIT" = "systemd" ]; then journalctl -u fail2ban -n 20 --no-pager
+    else tail -20 /var/log/fail2ban.log 2>/dev/null || echo "无日志"; fi
+  fi
+}
+f2b_del(){ svc_disable fail2ban; rm -f "$F2B"; echo -e "${Y}✔ 防爆破已关闭${N}"; }
+
+keyonly_on(){
+  key_add
+  setc PasswordAuthentication no
+  setc PermitRootLogin prohibit-password
+  apply
+  echo -e "${G}已切换为仅密钥登录${N}"
+}
+keyonly_off(){
+  setc PasswordAuthentication yes
+  setc PermitRootLogin yes
+  apply
+  echo -e "${Y}密码登录已恢复，公钥保留${N}"
+}
+
+set_port(){
+  read -rp "  新端口 (1-65535): " p
+  if ! [[ "$p" =~ ^[0-9]+$ ]] || [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then
+    echo -e "${R}端口非法${N}"; return 1
+  fi
+  if [ "$p" != "$(cur_port)" ] && port_used "$p"; then
+    echo -e "${R}端口 $p 已被占用${N}"; return 1
+  fi
+  purge Port
+  echo "Port $p" > "$PORTCONF"
+  apply
+  if [ -f "$F2B" ]; then
+    sed -i "s/^port .*/port     = $p/" "$F2B"
+    svc_restart fail2ban
+  fi
+  echo -e "${Y}⚠ 请确认 VPS 厂商安全组已放行 $p${N}"
+  echo -e "${Y}⚠ 勿关闭当前窗口，另开窗口测试成功后再关${N}"
+}
+
+status(){
+clear
+echo -e "${R}  自用脚本，擅自使用后果自负${N}"
+echo "  ═══════════════════════════════════════════"
+has_key && echo -e "   公钥注入    : ${G}✅ 已部署${N}" || echo -e "   公钥注入    : ${R}❌ 未部署${N}"
+f2b_on   && echo -e "   防爆破      : ${G}✅ 已开启${N} (60s/5次封1分钟)" || echo -e "   防爆破      : ${R}❌ 未开启${N}"
+pw_on    && echo -e "   仅密钥登录  : ${R}❌ 密码登录开启中${N}" || echo -e "   仅密钥登录  : ${G}✅ 已开启${N}"
+echo -e "   SSH 端口    : ${C}$(cur_port)${N}"
+echo -e "   主机名      : ${C}$(hostname)${N}"
+echo -e "   系统        : ${C}$OSID${N} / 家族 ${C}$FAMILY${N} / 初始化 ${C}$INIT${N}"
+echo "  ═══════════════════════════════════════════"
+echo "   1、默认全开（注入公钥+防爆破+仅密钥登录）"
+echo "   2、注入公钥          （再次执行则关闭）"
+echo "   3、开启防爆破 60s/5次（再次执行则关闭）"
+echo "   4、仅密钥登录        （再次执行则关闭）"
+echo "   5、修改 SSH 端口"
+echo "   6、修改主机名"
+echo "   7、修改 root 密码"
+echo "   0、退出"
+echo "  ═══════════════════════════════════════════"
+[ "$FAMILY" = "unknown" ] && echo -e "${Y}  ⚠ 未识别的系统，功能可能不完整${N}"
+}
+
+while true; do
+  status
+  read -rp "  请选择 [回车=1]: " op
+  op=${op:-1}
+  case "$op" in
+    1) key_add; f2b_add; setc PasswordAuthentication no; setc PermitRootLogin prohibit-password; apply ;;
+    2) if has_key; then key_del; else key_add; apply; fi ;;
+    3) if f2b_on; then f2b_del; else f2b_add; fi ;;
+    4) if pw_on; then keyonly_on; else keyonly_off; fi ;;
+    5) set_port ;;
+    6) read -rp "  新主机名: " h
+       if [ -n "$h" ]; then
+         set_hostname "$h"
+         sed -i "s/^127.0.1.1.*/127.0.1.1\t$h/" /etc/hosts 2>/dev/null
+         grep -q "^127.0.1.1" /etc/hosts || printf "127.0.1.1\t%s\n" "$h" >> /etc/hosts
+         echo -e "${G}✔ 已改为 $h${N}"
+       fi ;;
+    7) passwd root ;;
+    0) exit 0 ;;
+    *) echo -e "${R}无效选项${N}" ;;
+  esac
+  read -rp "  回车继续..." _
+done
