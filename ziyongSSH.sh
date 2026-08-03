@@ -8,6 +8,7 @@ if [ -z "$BASH_VERSION" ]; then
 fi
 
 PUBKEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKkSf1uHPsLHRYVWPJ73yrEX5fU6FTIJEEwvBb4MD3Q7"
+PUBKEY2="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL1mSRnYvvYrv/ckppoC8q1KUiBAm3/FJk/H0jdOuGBM"
 SSHDIR="/etc/ssh/sshd_config.d"
 CONF="$SSHDIR/00-hardening.conf"
 PORTCONF="$SSHDIR/01-port.conf"
@@ -44,11 +45,7 @@ fi
 pkg_install(){
   echo -e "${C}安装 $1 中...${N}"
   case "$FAMILY" in
-    debian)
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update || echo -e "${Y}⚠ apt update 有源报错（见上方），忽略并继续尝试安装${N}"
-      apt-get install -y "$1"
-      ;;
+    debian) apt-get update && apt-get install -y "$1" ;;
     alpine) apk add --no-cache "$1" ;;
     rhel)   command -v dnf >/dev/null && dnf install -y "$1" || yum install -y "$1" ;;
     *) echo -e "${R}未知系统，无法自动安装 $1${N}"; return 1 ;;
@@ -75,7 +72,8 @@ fi
 touch "$CONF"
 
 cur_port(){ sshd -T 2>/dev/null | awk '/^port /{print $2; exit}'; }
-has_key(){ [ -f "$AK" ] && grep -qF "$PUBKEY" "$AK"; }
+has_key(){  [ -f "$AK" ] && grep -qF "$PUBKEY"  "$AK"; }
+has_key2(){ [ -f "$AK" ] && grep -qF "$PUBKEY2" "$AK"; }
 pw_on(){ sshd -T 2>/dev/null | grep -q '^passwordauthentication yes'; }
 f2b_on(){ svc_active fail2ban; }
 
@@ -140,11 +138,52 @@ key_add(){
   return 0
 }
 key_del(){
-  if pw_on; then
+  if pw_on || has_key2; then
     grep -vF "$PUBKEY" "$AK" > "$AK.t" 2>/dev/null && mv "$AK.t" "$AK" && chmod 600 "$AK"
     echo -e "${Y}✔ 公钥已撤销${N}"
   else
-    echo -e "${R}✘ 拒绝：密码登录已关闭，撤销公钥会导致无法登录${N}"
+    echo -e "${R}✘ 拒绝：密码登录已关闭且无备用公钥，撤销公钥会导致无法登录${N}"
+  fi
+}
+
+key2_add(){
+  if ! mkdir -p /root/.ssh 2>/tmp/.k2.$$; then
+    echo -e "${R}✘ 无法创建 /root/.ssh 目录，报错：${N}"; cat /tmp/.k2.$$; rm -f /tmp/.k2.$$; return 1
+  fi
+  chmod 700 /root/.ssh
+  if ! touch "$AK" 2>/tmp/.k2.$$; then
+    echo -e "${R}✘ 无法创建 $AK ，报错：${N}"; cat /tmp/.k2.$$; rm -f /tmp/.k2.$$; return 1
+  fi
+  if ! has_key2; then
+    if ! echo "$PUBKEY2" >> "$AK" 2>/tmp/.k2.$$; then
+      echo -e "${R}✘ 写入备用公钥失败，报错：${N}"; cat /tmp/.k2.$$; rm -f /tmp/.k2.$$
+      echo -e "${Y}  磁盘：$(df -h /root 2>&1 | tail -1)${N}"
+      echo -e "${Y}  属性：$(lsattr "$AK" 2>&1)${N}"
+      return 1
+    fi
+  fi
+  rm -f /tmp/.k2.$$
+  sed -i '/^$/d' "$AK"; chmod 600 "$AK"
+  if ! has_key2; then
+    echo -e "${R}✘ 校验失败：备用公钥没有出现在 $AK 里${N}"
+    echo -e "${Y}  脚本内 PUBKEY2：${N}$PUBKEY2"
+    echo -e "${Y}  文件实际内容：${N}"; cat "$AK" 2>&1
+    return 1
+  fi
+  setc PubkeyAuthentication yes
+  echo -e "${G}✔ 备用公钥已注入并校验通过（与主公钥共存，两把都能登）${N}"
+  return 0
+}
+key2_del(){
+  if has_key || pw_on; then
+    grep -vF "$PUBKEY2" "$AK" > "$AK.t2" 2>/dev/null && mv "$AK.t2" "$AK" && chmod 600 "$AK"
+    if has_key2; then
+      echo -e "${R}✘ 撤销失败，$AK 中仍存在备用公钥${N}"; return 1
+    fi
+    echo -e "${Y}✔ 备用公钥已撤销（主公钥保留）${N}"
+  else
+    echo -e "${R}✘ 拒绝：主公钥不存在且密码登录已关闭，撤销备用公钥会导致无法登录${N}"
+    return 1
   fi
 }
 
@@ -239,7 +278,8 @@ status(){
 clear
 echo -e "${R}  自用脚本，擅自使用后果自负${N}"
 echo "  ═══════════════════════════════════════════"
-has_key && echo -e "   公钥注入    : ${G}✅ 已部署${N}" || echo -e "   公钥注入    : ${R}❌ 未部署${N}"
+has_key  && echo -e "   公钥注入    : ${G}✅ 已部署${N}" || echo -e "   公钥注入    : ${R}❌ 未部署${N}"
+has_key2 && echo -e "   备用公钥    : ${G}✅ 已部署${N}" || echo -e "   备用公钥    : ${R}❌ 未部署${N}"
 f2b_on   && echo -e "   防爆破      : ${G}✅ 已开启${N} (60s/5次封1分钟)" || echo -e "   防爆破      : ${R}❌ 未开启${N}"
 pw_on    && echo -e "   仅密钥登录  : ${R}❌ 密码登录开启中${N}" || echo -e "   仅密钥登录  : ${G}✅ 已开启${N}"
 echo -e "   SSH 端口    : ${C}$(cur_port)${N}"
@@ -253,6 +293,7 @@ echo "   4、仅密钥登录        （再次执行则关闭）"
 echo "   5、修改 SSH 端口"
 echo "   6、修改主机名"
 echo "   7、修改 root 密码"
+echo "   9、注入备用公钥      （再次执行则撤销）"
 echo "   0、退出"
 echo "  ═══════════════════════════════════════════"
 [ "$FAMILY" = "unknown" ] && echo -e "${Y}  ⚠ 未识别的系统，功能可能不完整${N}"
@@ -288,6 +329,7 @@ run_op(){
          echo -e "${G}✔ 已改为 $h${N}"
        fi ;;
     7) passwd root ;;
+    9) if has_key2; then key2_del; else key2_add && apply; fi ;;
     0) exit 0 ;;
     *) echo -e "${R}无效选项${N}"; return 1 ;;
   esac
@@ -298,7 +340,8 @@ if [ -n "$1" ]; then
   echo -e "${C}非交互模式，执行选项 $1${N}"
   run_op "$1"; rc=$?
   echo -e "${C}══ 执行完毕，当前状态 ══${N}"
-  has_key && echo -e "   公钥注入    : ${G}✅ 已部署${N}" || echo -e "   公钥注入    : ${R}❌ 未部署${N}"
+  has_key  && echo -e "   公钥注入    : ${G}✅ 已部署${N}" || echo -e "   公钥注入    : ${R}❌ 未部署${N}"
+  has_key2 && echo -e "   备用公钥    : ${G}✅ 已部署${N}" || echo -e "   备用公钥    : ${R}❌ 未部署${N}"
   f2b_on   && echo -e "   防爆破      : ${G}✅ 已开启${N}" || echo -e "   防爆破      : ${R}❌ 未开启${N}"
   pw_on    && echo -e "   仅密钥登录  : ${R}❌ 密码登录开启中${N}" || echo -e "   仅密钥登录  : ${G}✅ 已开启${N}"
   echo -e "   SSH 端口    : ${C}$(cur_port)${N}"
