@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XBoard 节点部署脚本  v0.3
+XBoard 节点部署脚本  v0.4
 适用: Debian 12 / root 运行
 
 用法 (方案乙, 不落盘):
@@ -14,6 +14,14 @@ XBoard 节点部署脚本  v0.3
 
 参数配好一次后会存到 /etc/V2bX/.node_setup_conf.json (600),
 以后直接 python3 /root/nodeup.py 即可, 不用再带参数.
+
+v0.4 相比 v0.3:
+  1. 本机节点识别改为"强证据优先": config.json 的 NodeID + 节点名含主机名
+     + 编号匹配 + 复制节点. IP 匹配降级为兜底(前面全空才用)并标 仅供参考.
+     中转/落地机的出口 IP 会被别的机器节点借用, v0.3 直接采信导致误判.
+  2. 编号推断平票时, 优先选后缀剥得更干净的那个标识
+  3. 新机器进来直接进编号输入框, 不再多问一次 y
+  4. V2bX 安装源改为自持镜像 V2BX_REPO / V2BX_VERSION, 防上游删库
 
 v0.3 相比 v0.2:
   1. 顶部显示本机全部相关节点(含分割线/复制节点)并带端口
@@ -32,6 +40,10 @@ V2BX_APIKEY = ""
 GROUP_IDS   = ["2"]
 REALITY_SNI = "apple.com"
 CERT_DOMAIN = "www.bing.com"
+
+# V2bX 安装源 (自持镜像, 防上游删库)
+V2BX_REPO    = "hahaaa789"
+V2BX_VERSION = "v0.4.0"
 
 PORT_MIN, PORT_MAX = 20000, 50000
 HOP_DEFAULT = (60000, 62999)
@@ -199,7 +211,7 @@ def parse_args(argv):
 
 def print_usage():
     print("")
-    print("XBoard 节点部署脚本 v0.3")
+    print("XBoard 节点部署脚本 v0.4")
     print("")
     print("用法:")
     print("  python3 <(curl -fsSL <脚本地址>) --panel <面板> --path <安全路径> \\")
@@ -578,9 +590,12 @@ def install_v2bx():
         ok("V2bX 已安装, 跳过")
         return
     info("正在下载并安装 V2bX, 这一步可能需要 1-3 分钟 ...")
+    info("安装源: github.com/%s/V2bX-script  版本: %s"
+         % (V2BX_REPO, V2BX_VERSION or "latest"))
     rc, out = run("cd /root && wget -N --no-check-certificate "
-                  "https://raw.githubusercontent.com/wyx2685/V2bX-script/master/install.sh "
-                  "&& echo n | bash install.sh", check=False, timeout=600)
+                  "https://raw.githubusercontent.com/%s/V2bX-script/master/install.sh "
+                  "&& echo n | bash install.sh %s" % (V2BX_REPO, V2BX_VERSION),
+                  check=False, timeout=600)
     if not v2bx_installed():
         die("V2bX 安装失败:\n" + out[-1500:])
     ok("V2bX 安装完成")
@@ -994,19 +1009,28 @@ def guess_code(matched, hostname):
             tally[full] = tally.get(full, 0) + 1
     if not tally:
         return ""
-    best = sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+    # v0.4: 平票时优先选"后缀剥得更干净"的(解析后更短), 再按字母序兜底
+    best = sorted(tally.items(), key=lambda kv: (-kv[1], len(kv[0]), kv[0]))[0][0]
     return best
 
 # ==================== 启动探测 (v0.3 重写) ====================
 def build_related(ctx, nodes):
-    """v0.3 核心改动 1: 四路并集找出本机全部相关节点
-       A. config.json 里的 NodeID
-       B. 面板上 host == 本机出口地址
-       C. 面板上 parse_code(name) == 本机编号   -> 抓分割线
-       D. 面板上 parent_id 属于 A/B/C          -> 抓复制节点
+    """v0.4 核心改动 1: 强证据优先, IP 只做兜底
+
+       强证据 (三路并集):
+         A. conf  : config.json 里在跑的 NodeID  -> 比对面板节点目录
+         B. name  : 节点名里含本机主机名子串
+         C. code  : 节点名解析出的编号 == 本机编号 -> 抓分割线
+         D. child : parent_id 属于 A/B/C         -> 抓复制节点
+
+       弱证据 (兜底):
+         E. host  : 面板 host == 本机出口 IP
+                    仅当 A/B/C/D 全空时才启用, 且逐条标记 [IP匹配·仅供参考]
+                    中转/落地机的 IP 会被别的机器节点借用, 直接采信必然误判
     """
     host = str(ctx.get("host") or "")
     code = str(ctx.get("code") or "")
+    hostname = str(ctx.get("hostname") or "").strip()
     local_ids = set(i for i, _ in ctx.get("local_ids", []))
     core_by_id = dict((i, t) for i, t in ctx.get("local_ids", []))
     by_id = {}
@@ -1026,22 +1050,24 @@ def build_related(ctx, nodes):
                 picked[i]["src"].append(src)
             return
         picked[i] = {"n": n, "src": [src]}
-    # A
+    # ---- A: config.json 里在跑的 NodeID (最强证据) ----
     for i in local_ids:
         if i in by_id:
             take(by_id[i], "conf")
-    # B
-    if host and host != "127.0.0.1":
+    # ---- B: 节点名含本机主机名 (强证据) ----
+    if hostname and len(hostname) >= 3:
+        hl = hostname.lower()
         for n in nodes:
-            if str(n.get("host")) == host:
-                take(n, "host")
-    # C
+            nm = str(n.get("name") or "")
+            if hl in strip_sep(nm).lower():
+                take(n, "name")
+    # ---- C: 节点名解析出的编号 == 本机编号 (强证据, 主要抓分割线) ----
     if code:
         for n in nodes:
             num, full = parse_code(n.get("name") or "")
             if full and full == code:
                 take(n, "code")
-    # D
+    # ---- D: parent_id 属于 A/B/C 的复制节点 (强证据) ----
     base = set(picked.keys())
     for n in nodes:
         pid = n.get("parent_id")
@@ -1052,6 +1078,25 @@ def build_related(ctx, nodes):
                 take(n, "child")
         except Exception:
             pass
+    # ---- E: IP 兜底. 前面全空才用, 否则一律不采信 ----
+    ctx["ip_fallback"] = False
+    if not picked and host and host != "127.0.0.1":
+        for n in nodes:
+            if str(n.get("host")) == host:
+                take(n, "host")
+        if picked:
+            ctx["ip_fallback"] = True
+            # 兜底命中的也要把它们的复制节点带上
+            base2 = set(picked.keys())
+            for n in nodes:
+                pid = n.get("parent_id")
+                if pid is None or pid == "":
+                    continue
+                try:
+                    if int(pid) in base2:
+                        take(n, "child")
+                except Exception:
+                    pass
     rel = []
     for i in sorted(picked.keys()):
         n = picked[i]["n"]
@@ -1062,6 +1107,8 @@ def build_related(ctx, nodes):
             kind = "复制"
         elif is_separator(n):
             kind = "分割线"
+        nm_has_host = bool(hostname) and (hostname.lower()
+                          in strip_sep(str(n.get("name") or "")).lower())
         rel.append({
             "id": i,
             "name": n.get("name"),
@@ -1076,6 +1123,9 @@ def build_related(ctx, nodes):
             "in_conf": in_conf,
             "kind": kind,
             "src": src,
+            "weak": ("host" in src) and ("conf" not in src)
+                    and ("name" not in src) and ("code" not in src),
+            "no_hostname": (not nm_has_host) and kind == "普通",
             "on_panel": True,
         })
     # config.json 里有但面板上没有的, 单独补一条
@@ -1087,7 +1137,8 @@ def build_related(ctx, nodes):
                              else "<面板查询失败>",
             "type": t, "core_type": t, "host": "", "port": "",
             "server_port": "", "show": None, "rate": "", "parent_id": None,
-            "in_conf": True, "kind": "普通", "src": ["conf"], "on_panel": False,
+            "in_conf": True, "kind": "普通", "src": ["conf"],
+            "weak": False, "no_hostname": False, "on_panel": False,
         })
     rel.sort(key=lambda x: (0 if x["kind"] == "分割线" else 1, x["id"]))
     return rel
@@ -1171,7 +1222,7 @@ def fmt_port(m):
 def print_header(ctx):
     os.system("clear")
     print(C_B + "=" * 60 + C_0)
-    print(C_B + "XBoard 节点部署脚本  v0.3" + C_0)
+    print(C_B + "XBoard 节点部署脚本  v0.4" + C_0)
     print(C_B + "=" * 60 + C_0)
     print("主机名   : %s" % ctx["hostname"])
     print("出口地址 : %s" % ctx.get("host", "(未选择)"))
@@ -1190,8 +1241,12 @@ def print_header(ctx):
                 tag += C_B + " [分割线]" + C_0
             elif m["kind"] == "复制":
                 tag += C_B + " [子]" + C_0
-            if not m["in_conf"] and m["kind"] == "普通":
+            if m.get("weak"):
+                tag += C_Y + " [IP匹配·仅供参考]" + C_0
+            elif not m["in_conf"] and m["kind"] == "普通":
                 tag += C_Y + " [仅面板]" + C_0
+            if m.get("no_hostname") and not m.get("weak"):
+                tag += C_Y + " [名字不含主机名]" + C_0
             if not m["on_panel"]:
                 tag += C_R + " [面板无此节点]" + C_0
             elif m["show"] in (0, False):
@@ -1214,7 +1269,8 @@ def print_header(ctx):
         print("跳跃规则 : " + ", ".join("%d-%d->%d" % (a, b, p) for a, b, p in hops))
     print(C_B + "=" * 60 + C_0)
 
-def ensure_code(ctx, force=False):
+def ensure_code(ctx, force=False, allow_skip=False):
+    """allow_skip=True 时, 直接回车(且没有默认值)就返回 "" 表示跳过"""
     if ctx.get("code") and not force:
         return ctx["code"]
     print("")
@@ -1226,7 +1282,12 @@ def ensure_code(ctx, force=False):
     if m:
         curnum = m.group(1)
     while True:
-        c = ask("请输入本机编号 (例 2031)", curnum)
+        if allow_skip and not curnum:
+            c = ask("请输入本机编号 (例 2031) [回车=跳过]", "")
+            if not c:
+                return ""
+        else:
+            c = ask("请输入本机编号 (例 2031)", curnum)
         if c.isdigit() and len(c) == 4:
             break
         err("必须是 4 位数字")
@@ -1238,7 +1299,7 @@ def ensure_code(ctx, force=False):
     info("HY2      %s-HY2" % full)
     info("SS22     %s-SS22" % full)
     if not confirm("确认", True):
-        return ensure_code(ctx, force=True)
+        return ensure_code(ctx, force=True, allow_skip=allow_skip)
     ctx["code"] = full
     ctx["code_guessed"] = False
     state_set(code=full)
@@ -1564,7 +1625,9 @@ def manage_local(ctx):
                 tag += C_B + " [分割线]" + C_0
             elif m["kind"] == "复制":
                 tag += C_B + " [子]" + C_0
-            if not m["in_conf"] and m["kind"] == "普通":
+            if m.get("weak"):
+                tag += C_Y + " [IP匹配·仅供参考]" + C_0
+            elif not m["in_conf"] and m["kind"] == "普通":
                 tag += C_Y + " [仅面板]" + C_0
             if not m["on_panel"]:
                 tag += C_R + " [面板无此节点]" + C_0
@@ -2004,9 +2067,9 @@ def main():
         warn("这是一台新机器 (本机没有 V2bX 节点配置)")
         info("先把机器编号定下来, 后面部署就不用再问了")
         info("直接回车可以跳过, 到选 1 部署时再问")
-        s = ask("现在就设置编号吗 [回车=跳过, y=现在设置]", "")
-        if s.strip().lower() in ("y", "yes"):
-            ensure_code(ctx, force=True)
+        # v0.4 核心改动 3: 去掉 y 确认, 直接进输入框
+        got = ensure_code(ctx, force=True, allow_skip=True)
+        if got:
             probe(ctx)
             print_header(ctx)
         else:
