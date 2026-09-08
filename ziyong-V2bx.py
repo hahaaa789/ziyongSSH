@@ -1611,7 +1611,7 @@ def fmt_port(m):
 def print_header(ctx):
     os.system("clear")
     print(C_B + "=" * 60 + C_0)
-    print(C_B + "XBoard 节点部署脚本  v0.6" + C_0)
+    print(C_B + "XBoard 节点部署脚本  v0.7" + C_0)
     print(C_B + "=" * 60 + C_0)
     print("主机名   : %s" % ctx["hostname"])
     print("出口地址 : %s" % ctx.get("host", "(未选择)"))
@@ -1829,6 +1829,7 @@ def pl_separator_raw(name):
     p["type"] = "shadowsocks"
     p["protocol_settings"] = {"cipher": "aes-128-gcm", "obfs": None, "obfs_settings": None}
     return p
+
 def restart_v2bx():
     print("")
     info("正在重启 V2bX ...")
@@ -1904,9 +1905,8 @@ def deploy_all(ctx):
         nodes = get_nodes()
         sep_name = "------%s------" % code
         if find_node_by_name(nodes, sep_name):
-            warn("分割线 %s 已存在, 跳过" % sep_name)
-        else:
-            create_and_fetch(pl_separator(code), built)
+            raise RuntimeError("清理后分割线 %s 仍存在, 面板状态异常" % sep_name)
+        create_and_fetch(pl_separator(code), built)
         id_vless = create_and_fetch(
             pl_vless("%s-VLESS" % code, host, p_vless, priv, pub, sid), built)
         id_hy2 = create_and_fetch(
