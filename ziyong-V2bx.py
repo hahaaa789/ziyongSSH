@@ -753,6 +753,46 @@ def save_hop_rules(rules):
     st["hops"] = [[a, b, c] for a, b, c in rules]
     save_state(st)
 
+HOP_SVC   = "/etc/systemd/system/hy2hop.service"
+
+def install_hop_service():
+    """独立 systemd 单元, 只负责 hy2hop 一张表.
+    刻意不碰 /etc/nftables.conf, 因为 Debian 默认那份第一句是 flush ruleset,
+    会把 iptables-nft 的 table ip nat (常见的中转转发规则) 一起清掉."""
+    body = ("[Unit]\n"
+            "Description=HY2 port hopping (hy2hop table only)\n"
+            "After=network-online.target\n"
+            "Wants=network-online.target\n"
+            "\n"
+            "[Service]\n"
+            "Type=oneshot\n"
+            "RemainAfterExit=yes\n"
+            "ExecStart=/usr/sbin/nft -f %s\n"
+            "ExecStop=/bin/sh -c '/usr/sbin/nft delete table ip hy2hop 2>/dev/null; "
+            "/usr/sbin/nft delete table ip6 hy2hop6 2>/dev/null; true'\n"
+            "\n"
+            "[Install]\n"
+            "WantedBy=multi-user.target\n") % NFT_FILE
+    try:
+        old = ""
+        if os.path.exists(HOP_SVC):
+            with open(HOP_SVC, "r", encoding="utf-8", errors="ignore") as f:
+                old = f.read()
+        if old != body:
+            with open(HOP_SVC, "w") as f:
+                f.write(body)
+            run("systemctl daemon-reload", check=False, timeout=30)
+    except Exception as e:
+        warn("写 hy2hop.service 失败: %s" % e)
+        return False
+    run("systemctl enable --now hy2hop >/dev/null 2>&1", check=False, timeout=30)
+    rc, out = run("systemctl is-enabled hy2hop 2>/dev/null", check=False, timeout=15)
+    if out.strip() != "enabled":
+        warn("hy2hop.service 未能设为开机自启, 重启后跳跃可能失效")
+        return False
+    ok("hy2hop.service 已启用 (重启后自动恢复跳跃规则)")
+    return True
+
 def write_nft_hop(rules, hard=True):
     """rules: [(hop_start, hop_end, target_port), ...] 全量重写
     hard=True 时加载失败直接报错停止"""
@@ -769,16 +809,6 @@ def write_nft_hop(rules, hard=True):
     with open(NFT_FILE, "w") as f:
         f.write("\n".join(body) + "\n")
     ok("已写入 " + NFT_FILE)
-    inc = 'include "/etc/nftables.d/*.nft"'
-    cur = ""
-    if os.path.exists(NFT_CONF):
-        cur = open(NFT_CONF).read()
-    if "nftables.d" not in cur:
-        backup_file(NFT_CONF)
-        with open(NFT_CONF, "a") as f:
-            f.write("\n" + inc + "\n")
-        info("已在 /etc/nftables.conf 追加 include")
-    run("systemctl enable nftables >/dev/null 2>&1", check=False, timeout=30)
     run("nft delete table ip hy2hop >/dev/null 2>&1", check=False, timeout=15)
     run("nft delete table ip6 hy2hop6 >/dev/null 2>&1", check=False, timeout=15)
     rc, out = run("nft -f " + NFT_FILE, check=False, timeout=30)
@@ -787,6 +817,16 @@ def write_nft_hop(rules, hard=True):
             die("nft 加载失败, HY2 跳跃不会生效:\n" + out.strip()[:300])
         warn("nft 加载失败: " + out.strip()[:200])
         return False
+    rc2, o2 = run("nft list table ip hy2hop 2>/dev/null | grep -c redirect",
+                  check=False, timeout=15)
+    if rc2 != 0 or o2.strip() in ("", "0"):
+        msg = "规则没真正进内核, 端口跳跃不会生效 (nft -f 返回 0 但表里没有 redirect)"
+        if hard:
+            die(msg)
+        warn(msg)
+        return False
+    if not install_hop_service():
+        warn("跳跃规则当前已生效, 但重启后会消失")
     save_hop_rules(rules)
     for hs, he, tp in rules:
         ok("跳跃已生效 %d-%d -> %d" % (hs, he, tp))
@@ -805,6 +845,8 @@ def del_hop_rule(target_port):
         run("nft delete table ip6 hy2hop6 >/dev/null 2>&1", check=False, timeout=15)
         if os.path.exists(NFT_FILE):
             os.remove(NFT_FILE)
+        run("systemctl disable --now hy2hop >/dev/null 2>&1", check=False, timeout=30)
+        run("rm -f " + HOP_SVC, check=False, timeout=15)
         save_hop_rules([])
         info("已清空端口跳跃规则")
         return True
@@ -2642,6 +2684,8 @@ def uninstall(ctx):
                 err("删除 id=%s 失败: %s" % (m["id"], e))
     run("systemctl stop V2bX", check=False, timeout=60)
     run("systemctl disable V2bX >/dev/null 2>&1", check=False, timeout=30)
+    run("systemctl disable --now hy2hop >/dev/null 2>&1", check=False, timeout=30)
+    run("rm -f " + HOP_SVC, check=False, timeout=15)
     run("nft delete table ip hy2hop >/dev/null 2>&1", check=False, timeout=15)
     run("nft delete table ip6 hy2hop6 >/dev/null 2>&1", check=False, timeout=15)
     run("rm -f " + NFT_FILE, check=False, timeout=15)
