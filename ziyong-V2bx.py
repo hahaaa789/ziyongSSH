@@ -818,6 +818,10 @@ def hop_overlap(hs, he):
             out.append((a, b, p))
     return out
 
+def hop_overlap_list(rules, hs, he):
+    """在给定规则集里查重叠 (hop_overlap 查的是 state 里的全部规则)"""
+    return [(a, b, p) for a, b, p in rules if hs <= b and a <= he]
+
 # ==================== 转发环境 (v0.5) ====================
 def _hosts_has(hn):
     """/etc/hosts 里是否已有 127.0.1.1 指向本主机名"""
@@ -1874,16 +1878,49 @@ def deploy_all(ctx):
     p_hy2   = pick_port(ctx, "HY2  ", used)
     p_ss22  = pick_port(ctx, "SS22 ", used)
     hop_s, hop_e = HOP_DEFAULT
-    ov = hop_overlap(hop_s, hop_e)
-    if ov:
+    old_rules = load_hop_rules()
+    keep_rules = []
+    if old_rules:
+        ov = hop_overlap(hop_s, hop_e)
+        ov_ports = set(p for _a, _b, p in ov)
         print("")
-        warn("HY2 跳跃段 %d-%d 与本机已有规则重叠:" % (hop_s, hop_e))
-        for a, b, p in ov:
-            info("  已有 %d-%d -> %d" % (a, b, p))
-        info("重叠会让先匹配的规则抢走流量, 建议换一段")
-        if confirm("要手动改跳跃段吗", True):
+        line()
+        warn("本机已有 %d 条 HY2 端口跳跃规则:" % len(old_rules))
+        print("")
+        for a, b, p in old_rules:
+            tag = ""
+            if p in ov_ports:
+                tag = "  " + C_Y + "[与本次 %d-%d 重叠]" % (hop_s, hop_e) + C_0
+            info("  %d-%d -> 端口 %d%s" % (a, b, p, tag))
+        print("")
+        warn("一键部署会【全量重写】跳跃规则, 默认会把上面这些全部清掉")
+        print("")
+        info("  1) 用最新的        清掉上面全部, 只保留本次 %d-%d (推荐)" % (hop_s, hop_e))
+        info("  2) 保留旧规则      旧的继续留着, 本次自动另换一段")
+        info("  3) 手动指定        自己填本次的跳跃段")
+        print("")
+        ch = ask("选择", "1")
+        while ch not in ("1", "2", "3"):
+            err("只能填 1 / 2 / 3")
+            ch = ask("选择", "1")
+        if ch == "2":
+            keep_rules = [r for r in old_rules if r[2] != p_hy2]
+            hop_s, hop_e = HOP_EXTRA
+            if hop_overlap_list(keep_rules, hop_s, hop_e):
+                print("")
+                warn("备用段 %d-%d 也和保留的规则重叠, 请手动指定" % (hop_s, hop_e))
+                while True:
+                    hop_s = ask_int("跳跃起始", hop_s, 1024, 65535)
+                    hop_e = ask_int("跳跃结束", hop_e, hop_s, 65535)
+                    if not hop_overlap_list(keep_rules, hop_s, hop_e):
+                        break
+                    warn("%d-%d 仍然重叠, 请重填" % (hop_s, hop_e))
+            ok("将保留 %d 条旧规则, 本次使用 %d-%d" % (len(keep_rules), hop_s, hop_e))
+        elif ch == "3":
             hop_s = ask_int("跳跃起始", hop_s, 1024, 65535)
             hop_e = ask_int("跳跃结束", hop_e, hop_s, 65535)
+        else:
+            ok("将清空 %d 条旧规则, 只使用 %d-%d" % (len(old_rules), hop_s, hop_e))
     step_total(8)
     step("安装 V2bX")
     if not v2bx_installed():
@@ -1925,7 +1962,7 @@ def deploy_all(ctx):
     write_v2bx_conf(entries, replace_all=True)
     step_done()
     step("配置 HY2 端口跳跃")
-    write_nft_hop([(hop_s, hop_e, p_hy2)], hard=False)
+    write_nft_hop(keep_rules + [(hop_s, hop_e, p_hy2)], hard=False)
     step_done()
     step("时间同步")
     ensure_chrony()
@@ -1940,7 +1977,7 @@ def deploy_all(ctx):
     state_set(code=code, host=host,
               ports={"vless": p_vless, "hy2": p_hy2, "ss22": p_ss22},
               reality_public_key=pub, short_id=sid,
-              hops=[[hop_s, hop_e, p_hy2]])
+              hops=[[a, b, p] for a, b, p in keep_rules] + [[hop_s, hop_e, p_hy2]])
     print("")
     line()
     ok("部署完成")
