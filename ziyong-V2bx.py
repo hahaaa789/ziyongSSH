@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XBoard 节点部署脚本  v0.6
+XBoard 节点部署脚本  v0.7
 适用: Debian 12 / root 运行
 
 用法 (方案乙, 不落盘):
@@ -14,6 +14,14 @@ XBoard 节点部署脚本  v0.6
 
 参数配好一次后会存到 /etc/V2bX/.node_setup_conf.json (600),
 以后直接 python3 /root/nodeup.py 即可, 不用再带参数.
+
+v0.7 相比 v0.6:
+  1. 一键部署新增"同编号覆盖": 检测到面板已存在同 4 位编号的节点组时,
+     列出清单 -> 二次确认(回车=取消, 必须输 y) -> 整组删除 -> 再建新的.
+     跨主机名也能识别 (20010-A机 与 20010-B机 视为同一编号).
+  2. 覆盖动作只在菜单 1 一键部署里出现; 菜单 2/3/4 新增、菜单 5 复制
+     完全不含任何删除逻辑, 行为与 v0.6 一致.
+  3. 新增菜单 14 新增分割线: 内容交互手填, 只在面板建一条占位, 不动本机.
 
 v0.6 相比 v0.5:
   1. 节点命名规范定死: 编号-主机名-协议-备注
@@ -227,7 +235,7 @@ def parse_args(argv):
 
 def print_usage():
     print("")
-    print("XBoard 节点部署脚本 v0.6")
+    print("XBoard 节点部署脚本 v0.7")
     print("")
     print("用法:")
     print("  python3 <(curl -fsSL <脚本地址>) --panel <面板> --path <安全路径> \\")
@@ -1696,6 +1704,131 @@ def next_free_name(nodes, base):
             return cand
     raise RuntimeError("名字 %s 冲突太多" % base)
 
+def find_group_by_code(nodes, num):
+    """按 4 位编号找出面板上属于这个编号的所有节点(不分主机名).
+    返回 [{id,name,type,parent_id,is_sep,full}]
+    排序: 复制节点 -> 普通节点 -> 分割线 (先删子再删父, 分割线最后)"""
+    num = str(num).strip()
+    hit = []
+    for n in nodes:
+        nm = str(n.get("name") or "")
+        c, full = parse_code(nm)
+        if c and c == num:
+            try:
+                nid = int(n.get("id"))
+            except Exception:
+                continue
+            hit.append({
+                "id": nid,
+                "name": nm,
+                "type": n.get("type"),
+                "parent_id": n.get("parent_id"),
+                "is_sep": is_separator(n),
+                "full": full,
+            })
+    def rank(x):
+        if x["is_sep"]:
+            return 2
+        if x["parent_id"]:
+            return 0
+        return 1
+    hit.sort(key=lambda x: (rank(x), x["id"]))
+    return hit
+
+
+def purge_code_group(num, mine_full):
+    """一键部署专用: 删掉面板上编号 == num 的所有节点.
+    返回删除条数; 用户取消返回 -1; 面板本来就没有返回 0.
+    任何删不干净的情况直接 raise, 绝不带着残留继续建节点."""
+    nodes = get_nodes()
+    group = find_group_by_code(nodes, num)
+    if not group:
+        return 0
+    print("")
+    line()
+    warn("面板上已存在编号 %s 的节点, 共 %d 条:" % (num, len(group)))
+    print("")
+    same_host = 0
+    for g in group:
+        if g["is_sep"]:
+            tag = "  <- 分割线"
+        elif g["parent_id"]:
+            tag = "  <- 复制节点(parent=%s)" % g["parent_id"]
+        else:
+            tag = ""
+        if g["full"] and g["full"] == mine_full:
+            tag += "  " + C_Y + "[与本机标识相同]" + C_0
+            same_host += 1
+        info("  id=%-8s %s%s" % (g["id"], g["name"], tag))
+    print("")
+    if same_host == 0:
+        warn("注意: 上面没有一条和本机标识 %s 相同" % mine_full)
+        warn("说明这些节点属于【另一台机器】, 删掉后那台机器会掉线")
+    warn("继续将把以上 %d 条从面板【全部删除】, 然后重建一组新的" % len(group))
+    warn("删除后 id 会变 / 老订阅链接失效 / 历史流量清零 / 无法撤销")
+    line()
+    if not confirm("确认删除这 %d 条并继续部署" % len(group), False):
+        return -1
+    print("")
+    done = 0
+    for g in group:
+        try:
+            drop_node(g["id"])
+            ok("已删 id=%s  %s" % (g["id"], g["name"]))
+            done += 1
+        except Exception as e:
+            err("删除失败 id=%s  %s  -> %s" % (g["id"], g["name"], e))
+    time.sleep(1.0)
+    left = find_group_by_code(get_nodes(), num)
+    if left:
+        print("")
+        for g in left:
+            err("残留 id=%s  %s" % (g["id"], g["name"]))
+        raise RuntimeError("编号 %s 仍有 %d 条没删掉, 已中止部署" % (num, len(left)))
+    ok("编号 %s 已从面板清空, 共删除 %d 条" % (num, done))
+    return done
+
+
+def add_separator(ctx):
+    """菜单 14: 只在面板建一条分割线. 不动 config.json, 不重启 V2bX, 不删任何东西."""
+    print("")
+    line()
+    info("新增分割线")
+    info("分割线是面板上的占位条目, 只用来在订阅里分组, 不承载流量")
+    line()
+    cur = ctx.get("code") or ""
+    txt = ask("分割线内容 (不用打两边的 -)", cur)
+    txt = strip_sep(txt).strip()
+    if not txt:
+        info("没填内容, 已取消")
+        return
+    dash = ask_int("两边各几个 -", 6, 1, 30)
+    name = "%s%s%s" % ("-" * dash, txt, "-" * dash)
+    if len(name) > 60:
+        err("名字太长了 (%d 字符), 面板可能存不下, 请缩短" % len(name))
+        return
+    nodes = get_nodes()
+    if find_node_by_name(nodes, name):
+        err("面板已存在同名分割线: %s" % name)
+        return
+    print("")
+    info("将新建分割线: " + C_G + name + C_0)
+    info("不会写 config.json, 不会重启 V2bX, 不会删除任何节点")
+    if not confirm("确认", True):
+        info("已取消")
+        return
+    built = []
+    create_and_fetch(pl_separator_raw(name), built)
+    print("")
+    ok("分割线已建好: %s" % name)
+
+
+def pl_separator_raw(name):
+    """按完整名字建分割线 (pl_separator 是按 code 自动加 ------)"""
+    p = pl_common(name, "127.0.0.1", 1, 1, 1, 1)
+    p["type"] = "shadowsocks"
+    p["protocol_settings"] = {"cipher": "aes-128-gcm", "obfs": None, "obfs_settings": None}
+    return p
 def restart_v2bx():
     print("")
     info("正在重启 V2bX ...")
@@ -1724,6 +1857,15 @@ def deploy_all(ctx):
     line()
     if not confirm("确认开始部署", True):
         info("已取消"); return
+    num = code.split("-")[0]
+    try:
+        n_del = purge_code_group(num, code)
+    except Exception as e:
+        die("清理旧编号失败: %s" % e, [])
+    if n_del == -1:
+        print("")
+        info("已取消, 面板没有做任何改动")
+        return
     used = used_ports(ctx)
     print("")
     info("端口分配 (回车=随机, 也可手填)")
@@ -2533,7 +2675,7 @@ def menu(ctx):
         print(" 5) 复制节点        订阅多一条一样的, 不动本机")
         print("")
         print("-- 管理 --")
-        print(" 6) 本机节点管理    看/删/改 本机相关节点")
+        print(" 6) 本机*节点管理    看/删/改 本机相关节点")
         print(" 7) 面板节点浏览    全部节点, 可过滤")
         print(" 8) 查看本机信息")
         print("")
@@ -2543,6 +2685,7 @@ def menu(ctx):
         print("11) 重新设置机器编号")
         print("12) 卸载并清理本机")
         print("13) 重新配置面板参数")
+        print("14) 新增分割线        只在面板建一条占位, 不动本机")
         print("")
         print("-- 系统 --")
         print("17) 转发环境检查/修复")
@@ -2597,6 +2740,8 @@ def menu(ctx):
                 forward_status(ctx)
             elif c == "18":
                 change_hostname(ctx)
+            elif c == "14":
+                add_separator(ctx); pause()
             elif c == "0":
                 print("")
                 return
