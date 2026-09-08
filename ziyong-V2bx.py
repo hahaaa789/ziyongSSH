@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XBoard 节点部署脚本  v0.4
+XBoard 节点部署脚本  v0.5
 适用: Debian 12 / root 运行
 
 用法 (方案乙, 不落盘):
@@ -14,6 +14,13 @@ XBoard 节点部署脚本  v0.4
 
 参数配好一次后会存到 /etc/V2bX/.node_setup_conf.json (600),
 以后直接 python3 /root/nodeup.py 即可, 不用再带参数.
+
+v0.5 相比 v0.4:
+  1. 一键部署/修复模式自动顺带配置转发环境 (hosts + iptables + ip_forward),
+     全部幂等, 失败只警告不中断部署
+  2. 新增菜单 17 转发环境检查/修复 (可单独手动跑, 带端口冲突展示)
+  3. 新增菜单 18 修改本机主机名, 改完可选批量改面板节点名
+  4. 菜单 14-16 预留空号
 
 v0.4 相比 v0.3:
   1. 本机节点识别改为"强证据优先": config.json 的 NodeID + 节点名含主机名
@@ -211,7 +218,7 @@ def parse_args(argv):
 
 def print_usage():
     print("")
-    print("XBoard 节点部署脚本 v0.4")
+    print("XBoard 节点部署脚本 v0.5")
     print("")
     print("用法:")
     print("  python3 <(curl -fsSL <脚本地址>) --panel <面板> --path <安全路径> \\")
@@ -794,6 +801,351 @@ def hop_overlap(hs, he):
             out.append((a, b, p))
     return out
 
+# ==================== 转发环境 (v0.5) ====================
+def _hosts_has(hn):
+    """/etc/hosts 里是否已有 127.0.1.1 指向本主机名"""
+    try:
+        with open("/etc/hosts", "r", encoding="utf-8", errors="ignore") as f:
+            txt = f.read()
+    except Exception:
+        return False, ""
+    for ln in txt.split("\n"):
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        parts = s.split()
+        if parts and parts[0] == "127.0.1.1" and hn in parts[1:]:
+            return True, txt
+    return False, txt
+
+def fix_hosts(hn=None, verbose=True):
+    """幂等: 给 /etc/hosts 补 127.0.1.1 主机名, 修 sudo 解析报错"""
+    hn = hn or socket.gethostname()
+    want = "127.0.1.1 " + hn
+    hit, txt = _hosts_has(hn)
+    if hit:
+        if verbose:
+            info("  hosts      已有 %s, 跳过" % want)
+        return True
+    try:
+        with open("/etc/hosts", "a", encoding="utf-8") as f:
+            if txt and not txt.endswith("\n"):
+                f.write("\n")
+            f.write(want + "\n")
+        ok("  hosts      已添加 %s" % want)
+        return True
+    except Exception as e:
+        warn("  hosts      写入失败: %s" % e)
+        return False
+
+def ensure_iptables(verbose=True):
+    """幂等: 已装直接跳过, 不进 apt 流程"""
+    rc, _ = run("command -v iptables >/dev/null 2>&1", check=False, timeout=15)
+    if rc == 0:
+        rc2, ver = run("iptables -V 2>/dev/null", check=False, timeout=15)
+        if verbose:
+            v = (ver or "").strip().split("\n")[0] or "未知版本"
+            info("  iptables   已安装 (%s)" % v)
+        return True
+    info("  iptables   未安装, 正在安装 ...")
+    rc3, _ = run("command -v apt-get >/dev/null 2>&1", check=False, timeout=15)
+    if rc3 == 0:
+        run("apt-get update", check=False, timeout=300)
+        rc4, _ = run("DEBIAN_FRONTEND=noninteractive apt-get install -y iptables",
+                     check=False, timeout=600)
+    else:
+        rc5, _ = run("command -v yum >/dev/null 2>&1", check=False, timeout=15)
+        if rc5 == 0:
+            rc4, _ = run("yum install -y iptables-services", check=False, timeout=600)
+        else:
+            rc4 = 1
+            warn("  iptables   没有 apt-get 也没有 yum, 装不了")
+    if rc4 == 0:
+        ok("  iptables   安装完成")
+        return True
+    warn("  iptables   安装失败, 转发可能用不了")
+    return False
+
+def ensure_ip_forward(verbose=True):
+    """持久化 + 立即生效. 容器里可能只读, 失败只警告"""
+    run("sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf", check=False, timeout=30)
+    run("echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf", check=False, timeout=30)
+    # -w 精准生效, 不被 sysctl.conf 里其他坏行拖累
+    run("sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1", check=False, timeout=30)
+    # -p best effort
+    run("sysctl -p >/dev/null 2>&1", check=False, timeout=60)
+    rc, cur = run("sysctl -n net.ipv4.ip_forward 2>/dev/null", check=False, timeout=30)
+    cur = (cur or "").strip()
+    if cur == "1":
+        ok("  ip_forward 1 (已持久化)")
+        return True
+    warn("  ip_forward %s, 设置未生效" % (cur or "读取失败"))
+    warn("             容器(LXC/OpenVZ)里这个参数可能是只读的, 转发用不了")
+    warn("             节点部署不受影响, 继续")
+    return False
+
+def ensure_forward(verbose=True):
+    """一键部署/修复模式顺带跑. 全程 check=False, 绝不中断主流程"""
+    if verbose:
+        info("配置转发环境 (hosts / iptables / ip_forward)")
+    r1 = r2 = r3 = False
+    try:
+        r1 = fix_hosts(verbose=verbose)
+    except Exception as e:
+        warn("  hosts      异常: %s" % e)
+    try:
+        r2 = ensure_iptables(verbose=verbose)
+    except Exception as e:
+        warn("  iptables   异常: %s" % e)
+    try:
+        r3 = ensure_ip_forward(verbose=verbose)
+    except Exception as e:
+        warn("  ip_forward 异常: %s" % e)
+    return r1 and r2 and r3
+
+def dnat_rules():
+    """读 iptables nat 表 PREROUTING, 返回 [(proto, dport, target), ...]"""
+    out = []
+    rc, txt = run("iptables -t nat -S PREROUTING 2>/dev/null", check=False, timeout=20)
+    if rc != 0 or not txt:
+        return out
+    for ln in txt.split("\n"):
+        if "-j DNAT" not in ln:
+            continue
+        mp = re.search(r"-p\s+(\w+)", ln)
+        md = re.search(r"--dport\s+([\d:]+)", ln)
+        mt = re.search(r"--to-destination\s+(\S+)", ln)
+        if md:
+            out.append((mp.group(1) if mp else "?",
+                        md.group(1),
+                        mt.group(1) if mt else "?"))
+    return out
+
+def dnat_busy_ports():
+    """DNAT 已占用的本地端口集合, 给端口冲突展示用"""
+    busy = set()
+    for _proto, dport, _t in dnat_rules():
+        try:
+            if ":" in dport:
+                a, b = dport.split(":", 1)
+                a, b = int(a), int(b)
+                if b - a > 5000:
+                    b = a + 5000
+                for p in range(a, b + 1):
+                    busy.add(p)
+            else:
+                busy.add(int(dport))
+        except Exception:
+            continue
+    return busy
+
+def forward_status(ctx):
+    """菜单 17: 只看不改的转发环境总览 + 端口冲突展示"""
+    print("")
+    line()
+    info("转发环境检查")
+    line()
+    hn = socket.gethostname()
+    hit, _ = _hosts_has(hn)
+    print("hosts        127.0.1.1 %-24s %s" % (
+        hn, "[已配置]" if hit else C_Y + "[缺失]" + C_0))
+    rc, ver = run("iptables -V 2>/dev/null", check=False, timeout=15)
+    v = (ver or "").strip().split("\n")[0]
+    print("iptables     %-36s %s" % (
+        v[:36] if rc == 0 else "-", "[已安装]" if rc == 0 else C_Y + "[未安装]" + C_0))
+    rc2, cur = run("sysctl -n net.ipv4.ip_forward 2>/dev/null", check=False, timeout=15)
+    cur = (cur or "").strip()
+    print("ip_forward   %-36s %s" % (
+        cur or "-", "[已开启]" if cur == "1" else C_Y + "[未开启]" + C_0))
+    rc3, act = run("systemctl is-active dnat 2>/dev/null", check=False, timeout=15)
+    rc4, ena = run("systemctl is-enabled dnat 2>/dev/null", check=False, timeout=15)
+    act = (act or "").strip() or "-"
+    ena = (ena or "").strip() or "-"
+    print("dnat 服务    %s / %s" % (act, ena))
+    rules = dnat_rules()
+    print("")
+    if rules:
+        info("当前 DNAT 规则 (%d 条):" % len(rules))
+        for proto, dport, tgt in rules[:40]:
+            info("  %-4s dport %-12s -> %s" % (proto, dport, tgt))
+        if len(rules) > 40:
+            info("  ... 还有 %d 条" % (len(rules) - 40))
+    else:
+        info("当前没有 DNAT 规则")
+    if os.path.exists("/etc/dnat/conf"):
+        try:
+            with open("/etc/dnat/conf", "r", encoding="utf-8", errors="ignore") as f:
+                cf = [x.strip() for x in f.read().split("\n") if x.strip()]
+            print("")
+            info("/etc/dnat/conf (%d 条):" % len(cf))
+            for x in cf[:40]:
+                info("  " + x)
+        except Exception as e:
+            warn("读 /etc/dnat/conf 失败: %s" % e)
+    busy = dnat_busy_ports()
+    mine = []
+    for m in (ctx.get("related") or []):
+        sp = m.get("server_port")
+        try:
+            sp = int(sp)
+        except Exception:
+            continue
+        if sp > 1:
+            mine.append((sp, m.get("id"), m.get("name")))
+    print("")
+    if mine:
+        info("本机节点端口 (%d 个):" % len(mine))
+        for sp, nid, nm in mine:
+            info("  %-6d id=%-6s %s" % (sp, nid, str(nm)[:30]))
+    hops = load_hop_rules()
+    if hops:
+        info("HY2 跳跃段:")
+        for a, b, p in hops:
+            info("  %d-%d -> %d" % (a, b, p))
+    print("")
+    clash = [x for x in mine if x[0] in busy]
+    hopclash = [(a, b, p) for a, b, p in hops
+                if any(a <= q <= b for q in busy)]
+    if clash or hopclash:
+        warn("发现端口冲突:")
+        for sp, nid, nm in clash:
+            warn("  节点端口 %d (id=%s %s) 已被 DNAT 占用" % (sp, nid, str(nm)[:24]))
+        for a, b, p in hopclash:
+            warn("  跳跃段 %d-%d 与 DNAT 端口重叠" % (a, b))
+        info("DNAT 优先级高于本机监听, 撞了的话节点会静默失联")
+        info("脚本不会自动改, 请自己调整 /etc/dnat/conf 或换节点端口")
+    else:
+        ok("端口冲突检查: 无冲突")
+    line()
+    pause()
+
+def valid_hostname(s):
+    """RFC1123 主机名校验"""
+    if not s or len(s) > 63:
+        return False
+    if not re.match(r"^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$", s):
+        return False
+    return True
+
+def change_hostname(ctx):
+    """菜单 18: 改本机主机名, 改完可选批量改面板节点名"""
+    old = socket.gethostname()
+    print("")
+    line()
+    info("修改本机主机名")
+    line()
+    info("当前主机名: " + C_G + old + C_0)
+    print("")
+    info("主机名会影响本机节点识别 (节点名含主机名 = 强证据)")
+    info("只能用 字母 数字 减号, 不超过 63 位")
+    print("")
+    new = ask("新主机名 (回车取消)", "")
+    if not new:
+        info("已取消"); pause(); return
+    if new == old:
+        info("和当前一样, 无需修改"); pause(); return
+    if not valid_hostname(new):
+        err("主机名不合法: 只能用 字母/数字/减号, 不能以减号开头结尾, 不超过 63 位")
+        pause(); return
+    print("")
+    warn("将把主机名 %s 改为 %s" % (old, new))
+    info("会做这些事: hostnamectl 立即生效 + 写 /etc/hostname + 补 /etc/hosts")
+    info("不会重启机器")
+    if not confirm("确认修改", False):
+        info("已取消"); pause(); return
+    rc, out = run("hostnamectl set-hostname %s 2>&1" % new, check=False, timeout=60)
+    if rc != 0:
+        run("echo %s > /etc/hostname" % new, check=False, timeout=30)
+        run("hostname %s >/dev/null 2>&1" % new, check=False, timeout=30)
+    now = socket.gethostname()
+    if now != new:
+        warn("主机名当前读到的还是 %s" % now)
+        warn("某些容器不允许改主机名, 或需要重启才生效")
+    else:
+        ok("主机名已改为 %s" % new)
+    fix_hosts(new, verbose=True)
+    ctx["hostname"] = now
+    print("")
+    warn("注意: 面板上已有的节点名还是旧主机名 %s" % old)
+    info("节点识别靠 config.json 的 NodeID 兜底, 不会立刻失效")
+    info("但名字里带旧主机名的节点, 下次就认不出 名字 这一路证据了")
+    aff = []
+    try:
+        nodes = ctx.get("all_nodes") or get_nodes()
+        ctx["all_nodes"] = nodes
+        lo = old.lower()
+        for m in (ctx.get("related") or []):
+            nm = str(m.get("name") or "")
+            if lo and lo in strip_sep(nm).lower() and m.get("on_panel"):
+                aff.append(m)
+    except Exception as e:
+        warn("读取面板节点失败: %s" % e)
+    if not aff:
+        print("")
+        info("本机相关节点里没有名字含旧主机名的, 无需改名")
+        probe(ctx)
+        pause(); return
+    print("")
+    info("以下 %d 个面板节点名字里含旧主机名:" % len(aff))
+    for m in aff:
+        nm = str(m.get("name") or "")
+        info("  id=%-6s %-32s -> %s" % (
+            m.get("id"), nm[:32], _rename_hostname(nm, old, new)[:32]))
+    print("")
+    if not confirm("要不要把这些节点名一起改成新主机名", False):
+        info("已跳过, 面板节点名保持不变")
+        probe(ctx)
+        pause(); return
+    done = fail = 0
+    for m in aff:
+        nm = str(m.get("name") or "")
+        newnm = _rename_hostname(nm, old, new)
+        if newnm == nm:
+            continue
+        node = node_by_id(ctx.get("all_nodes") or [], m.get("id"))
+        if not node:
+            warn("id=%s 面板取不到, 跳过" % m.get("id")); fail += 1; continue
+        try:
+            rename_node(node, newnm)
+            ok("id=%-6s -> %s" % (m.get("id"), newnm))
+            done += 1
+        except Exception as e:
+            err("id=%s 改名失败: %s" % (m.get("id"), e)); fail += 1
+        time.sleep(0.3)
+    print("")
+    ok("改名完成: 成功 %d 个, 失败 %d 个" % (done, fail))
+    probe(ctx)
+    pause()
+
+def _rename_hostname(name, old, new):
+    """把节点名里的旧主机名换成新主机名, 大小写不敏感, 只换第一处"""
+    if not old:
+        return name
+    i = name.lower().find(old.lower())
+    if i < 0:
+        return name
+    return name[:i] + new + name[i + len(old):]
+
+def rename_node(node, newname):
+    """只改 name, 其余字段原样回填"""
+    p = {
+        "id": int(node.get("id")),
+        "name": newname,
+        "type": node.get("type"),
+        "host": node.get("host"),
+        "port": str(node.get("port")),
+        "server_port": int(node.get("server_port")),
+        "group_ids": node.get("group_ids") or GROUP_IDS,
+        "rate": str(node.get("rate") or "1"),
+        "show": 1 if node.get("show") in (1, True, None) else 0,
+        "tags": node.get("tags") or [],
+        "protocol_settings": node.get("protocol_settings") or {},
+    }
+    if node.get("parent_id"):
+        p["parent_id"] = int(node["parent_id"])
+    save_node(p)
+    return True
+
 def ensure_chrony():
     rc, out = run("which chronyd", check=False, timeout=15)
     if rc != 0:
@@ -1222,7 +1574,7 @@ def fmt_port(m):
 def print_header(ctx):
     os.system("clear")
     print(C_B + "=" * 60 + C_0)
-    print(C_B + "XBoard 节点部署脚本  v0.4" + C_0)
+    print(C_B + "XBoard 节点部署脚本  v0.5" + C_0)
     print(C_B + "=" * 60 + C_0)
     print("主机名   : %s" % ctx["hostname"])
     print("出口地址 : %s" % ctx.get("host", "(未选择)"))
@@ -1406,6 +1758,9 @@ def deploy_all(ctx):
     step_done()
     step("时间同步")
     ensure_chrony()
+    step_done()
+    step("转发环境")
+    ensure_forward()
     step_done()
     step("启动 V2bX")
     run("systemctl enable V2bX >/dev/null 2>&1", check=False, timeout=30)
@@ -1839,6 +2194,7 @@ def repair(ctx):
     if hops:
         write_nft_hop(hops, hard=False)
     ensure_chrony()
+    ensure_forward()
     run("systemctl enable V2bX >/dev/null 2>&1", check=False, timeout=30)
     restart_v2bx()
     if code:
@@ -1972,6 +2328,10 @@ def menu(ctx):
         print("11) 重新设置机器编号")
         print("12) 卸载并清理本机")
         print("13) 重新配置面板参数")
+        print("")
+        print("-- 系统 --")
+        print("17) 转发环境检查/修复")
+        print("18) 修改本机主机名")
         print(" 0) 退出")
         print("")
         c = ask("请选择", "")
@@ -2018,6 +2378,10 @@ def menu(ctx):
                 if test_panel():
                     probe(ctx)
                 pause()
+            elif c == "17":
+                forward_status(ctx)
+            elif c == "18":
+                change_hostname(ctx)
             elif c == "0":
                 print("")
                 return
