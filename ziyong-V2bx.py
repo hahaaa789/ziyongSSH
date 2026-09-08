@@ -16,7 +16,7 @@ XBoard 节点部署脚本  v0.7
 以后直接 python3 /root/nodeup.py 即可, 不用再带参数.
 
 v0.7 相比 v0.6:
-  1. 一键部署新增"同编号覆盖": 检测到面板已存在同 4 位编号的节点组时,
+  1. 一键部署新增"同编号覆盖": 检测到面板已存在同编号的节点组时,
      列出清单 -> 二次确认(回车=取消, 必须输 y) -> 整组删除 -> 再建新的.
      跨主机名也能识别 (20010-A机 与 20010-B机 视为同一编号).
   2. 覆盖动作只在菜单 1 一键部署里出现; 菜单 2/3/4 新增、菜单 5 复制
@@ -1667,8 +1667,8 @@ def ensure_code(ctx, force=False, allow_skip=False):
     if ctx.get("code") and not force:
         return ctx["code"]
     print("")
-    info("编号规则: 4 位数字 + 主机名, 前两位是大类")
-    info("20xx=香港  30xx=亚太  40xx=美国  50xx=欧洲  60xx+=其他")
+    info("编号规则: 数字编号 + 主机名. 推荐 5 位: 前两位区域, 后三位区域内顺序")
+    info("20=香港  30=亚太  40=美国  50=欧洲  60+=其他   例 20010 = 香港第 10 台")
     cur = ctx.get("code", "")
     curnum = ""
     m = re.match(r"^(\d+)-", cur or "")
@@ -1676,14 +1676,18 @@ def ensure_code(ctx, force=False, allow_skip=False):
         curnum = m.group(1)
     while True:
         if allow_skip and not curnum:
-            c = ask("请输入本机编号 (例 2031) [回车=跳过]", "")
+            c = ask("请输入本机编号 (例 20010) [回车=跳过]", "")
             if not c:
                 return ""
         else:
-            c = ask("请输入本机编号 (例 2031)", curnum)
-        if c.isdigit() and len(c) == 4:
-            break
-        err("必须是 4 位数字")
+            c = ask("请输入本机编号 (例 20010)", curnum)
+        if not c.isdigit():
+            err("编号必须是纯数字")
+            continue
+        if not (2 <= len(c) <= 6):
+            err("编号长度只支持 2-6 位, 当前 %d 位" % len(c))
+            continue
+        break
     full = "%s-%s" % (c, ctx["hostname"])
     print("")
     info("将使用标识: " + C_G + full + C_0)
@@ -1709,7 +1713,7 @@ def next_free_name(nodes, base):
     raise RuntimeError("名字 %s 冲突太多" % base)
 
 def find_group_by_code(nodes, num):
-    """按 4 位编号找出面板上属于这个编号的所有节点(不分主机名).
+    """按编号找出面板上属于这个编号的所有节点(不分主机名).
     返回 [{id,name,type,parent_id,is_sep,full}]
     排序: 复制节点 -> 普通节点 -> 分割线 (先删子再删父, 分割线最后)"""
     num = str(num).strip()
