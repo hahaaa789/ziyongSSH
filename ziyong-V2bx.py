@@ -22,6 +22,7 @@ v0.7 相比 v0.6:
   2. 覆盖动作只在菜单 1 一键部署里出现; 菜单 2/3/4 新增、菜单 5 复制
      完全不含任何删除逻辑, 行为与 v0.6 一致.
   3. 新增菜单 14 新增分割线: 内容交互手填, 只在面板建一条占位, 不动本机.
+  4. 修复 payload 缺 route_ids 导致面板编辑页报错 (null.includes)
 
 v0.6 相比 v0.5:
   1. 节点命名规范定死: 编号-主机名-协议-备注
@@ -1265,6 +1266,7 @@ def rename_node(node, newname):
         "rate": str(node.get("rate") or "1"),
         "show": 1 if node.get("show") in (1, True, None) else 0,
         "tags": node.get("tags") or [],
+        "route_ids": node.get("route_ids") or [],
         "protocol_settings": node.get("protocol_settings") or {},
     }
     if node.get("parent_id"):
@@ -1356,6 +1358,7 @@ def pl_common(name, host, port, server_port, rate=1, show=1, group_ids=None):
         "rate": str(rate),
         "show": int(show),
         "tags": [],
+        "route_ids": [],
     }
 
 def pl_separator(code):
