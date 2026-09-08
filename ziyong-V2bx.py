@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XBoard 节点部署脚本  v0.5
+XBoard 节点部署脚本  v0.6
 适用: Debian 12 / root 运行
 
 用法 (方案乙, 不落盘):
@@ -14,6 +14,15 @@ XBoard 节点部署脚本  v0.5
 
 参数配好一次后会存到 /etc/V2bX/.node_setup_conf.json (600),
 以后直接 python3 /root/nodeup.py 即可, 不用再带参数.
+
+v0.6 相比 v0.5:
+  1. 节点命名规范定死: 编号-主机名-协议-备注
+     协议段用"整段全等"识别 (不数 -, 不认裸 ss, 必须一字不落是 ss22)
+     顺带修掉 v0.5 的 bug: 主机名以数字结尾(如 HK-01)会被误剥成 HK
+  2. 新增改 SNI 功能: VLESS 改 Reality server_name, HY2 改证书域名
+     面板 + 本机 config.json 同步改, 只改选中的单个节点
+  3. 菜单 7 面板浏览去掉 60 条截断, 全量列出
+  4. 菜单 6/7 的字母选项 (d/e/f) 全改成数字, 交互说明重写
 
 v0.5 相比 v0.4:
   1. 一键部署/修复模式自动顺带配置转发环境 (hosts + iptables + ip_forward),
@@ -218,7 +227,7 @@ def parse_args(argv):
 
 def print_usage():
     print("")
-    print("XBoard 节点部署脚本 v0.5")
+    print("XBoard 节点部署脚本 v0.6")
     print("")
     print("用法:")
     print("  python3 <(curl -fsSL <脚本地址>) --panel <面板> --path <安全路径> \\")
@@ -1324,33 +1333,53 @@ def is_separator(n):
     except Exception:
         return False
 
-def parse_code(name):
-    """从节点名提取机器编号(数字前缀)和完整标识.
-    支持:
-      5011-Bero-DE-VLESS        -> ('5011', '5011-Bero-DE')
-      613-YxVM-HK-VOL-HY2       -> ('613',  '613-YxVM-HK-VOL')
-      ------5011-Bero-DE------  -> ('5011', '5011-Bero-DE')
-    末尾的协议后缀和 -复制N 会被剥掉. 认不出返回 ('','')"""
+# v0.6 协议关键字表. 必须整段全等才算, 大小写不敏感.
+# 特别注意: 绝不能有裸 "ss", 否则 SS-Tokyo / Boss 之类会被误命中.
+PROTO_WORDS = set(["vless", "hy2", "hysteria", "hysteria2",
+                   "ss22", "ss2022", "shadowsocks", "trojan", "vmess"])
+
+def split_name(name):
+    """v0.6 命名规范解析: 编号-主机名-协议-备注
+
+    协议段用"整段全等"定位, 不数 - 的个数, 所以主机名里有多少个 - 都不影响.
+    协议段之前是主机名, 之后一律算备注 (含 复制2 / 2 这类).
+
+    例:
+      613-YxVM-HK-VOL-VLESS      -> ('613', 'YxVM-HK-VOL', 'vless', '')
+      613-HK-01-SS22-复制2       -> ('613', 'HK-01', 'ss22', '复制2')
+      613-HK-01-HY2-2            -> ('613', 'HK-01', 'hy2', '2')
+      ------613-YxVM-HK-VOL----- -> ('613', 'YxVM-HK-VOL', '', '')
+    认不出编号返回 ('','','','')"""
     s = strip_sep(name)
     if not s:
-        return "", ""
+        return "", "", "", ""
     m = re.match(r"^(\d+)-(.+)$", s)
     if not m:
-        return "", ""
+        return "", "", "", ""
     num = m.group(1)
-    rest = m.group(2)
-    parts = rest.split("-")
-    suffix = set(["vless", "hy2", "hysteria", "hysteria2", "ss22",
-                  "ss2022", "shadowsocks", "ss", "trojan", "vmess"])
-    while parts:
-        last = parts[-1].strip().lower()
-        if last in suffix or last.isdigit() or last.startswith("复制"):
-            parts.pop()
-            continue
-        break
-    if not parts:
+    parts = m.group(2).split("-")
+    # 从右往左找协议段, 取最靠右的那个, 避免主机名里的词干扰
+    idx = -1
+    for i in range(len(parts) - 1, -1, -1):
+        if parts[i].strip().lower() in PROTO_WORDS:
+            idx = i
+            break
+    if idx < 0:
+        return num, "-".join(parts).strip("-"), "", ""
+    hostpart = "-".join(parts[:idx]).strip("-")
+    proto = parts[idx].strip().lower()
+    note = "-".join(parts[idx + 1:]).strip("-")
+    return num, hostpart, proto, note
+
+def parse_code(name):
+    """兼容旧接口: 返回 (编号, 编号-主机名).
+    v0.6 起底层走 split_name, 协议整段全等识别."""
+    num, hostpart, proto, note = split_name(name)
+    if not num:
+        return "", ""
+    if not hostpart:
         return num, num
-    return num, "%s-%s" % (num, "-".join(parts))
+    return num, "%s-%s" % (num, hostpart)
 
 def guess_code(matched, hostname):
     """从本机已匹配的节点里推断编号. 取出现次数最多的那个完整标识"""
@@ -1574,7 +1603,7 @@ def fmt_port(m):
 def print_header(ctx):
     os.system("clear")
     print(C_B + "=" * 60 + C_0)
-    print(C_B + "XBoard 节点部署脚本  v0.5" + C_0)
+    print(C_B + "XBoard 节点部署脚本  v0.6" + C_0)
     print(C_B + "=" * 60 + C_0)
     print("主机名   : %s" % ctx["hostname"])
     print("出口地址 : %s" % ctx.get("host", "(未选择)"))
@@ -1929,6 +1958,171 @@ def copy_node(ctx):
         warn("节点建好了 id=%s, 但 parent_id 没写进去, 请到面板检查" % nid)
 
 # ==================== 6) 本机节点管理 ====================
+def valid_sni(d):
+    """域名基本校验: 只允许字母数字点和连字符, 至少一个点"""
+    d = (d or "").strip()
+    if not d or len(d) > 253 or "." not in d:
+        return False
+    return re.match(r"^[A-Za-z0-9.\-]+$", d) is not None
+
+def probe_tls13(domain):
+    """探测目标域名是否支持 TLS1.3 (Reality 的硬性前提).
+    返回 (是否支持, 说明). 探测本身失败不算不支持, 只是测不出来."""
+    rc, out = run("openssl s_client -connect %s:443 -servername %s "
+                  "-tls1_3 </dev/null 2>&1 | head -40" % (domain, domain),
+                  check=False, timeout=20)
+    low = (out or "").lower()
+    if "tlsv1.3" in low or "tls_aes" in low:
+        return True, "支持 TLS1.3"
+    if "connect:errno" in low or "unable to connect" in low:
+        return None, "连不上, 测不出来"
+    if "wrong version" in low or "no protocols available" in low:
+        return False, "不支持 TLS1.3"
+    return None, "测不出来"
+
+def local_sni_sync(node_id, new_sni):
+    """把本机 config.json 里对应 NodeID 的 CertDomain 同步改掉.
+    返回 True 表示确实改了本机文件."""
+    conf = load_v2bx_conf()
+    if not conf or not conf.get("Nodes"):
+        return False
+    hit = False
+    for e in conf["Nodes"]:
+        if int(e.get("NodeID", -1)) != int(node_id):
+            continue
+        cc = e.get("CertConfig") or {}
+        if cc.get("CertDomain") == new_sni:
+            hit = True
+            continue
+        cc["CertDomain"] = new_sni
+        e["CertConfig"] = cc
+        hit = True
+    if not hit:
+        return False
+    backup_file(V2BX_CONF)
+    with open(V2BX_CONF, "w", encoding="utf-8") as fp:
+        json.dump(conf, fp, indent=2, ensure_ascii=False)
+    return True
+
+def edit_node_sni(node):
+    """v0.6 改 SNI. 按节点 type 自动走对应那套:
+         vless    -> Reality server_name (+ tls_settings.server_name)
+         hysteria -> 证书域名 tls.server_name, 并重签本机自签证书
+       只改选中的这一个节点, 不动同机器其他节点."""
+    t = str(node.get("type") or "").lower()
+    nid = int(node.get("id"))
+    ps = node.get("protocol_settings") or {}
+    if t == "vless":
+        cur = ((ps.get("reality_settings") or {}).get("server_name")
+               or (ps.get("tls_settings") or {}).get("server_name") or "")
+        print("")
+        info("协议 VLESS (Reality)  当前 SNI: %s" % (cur or "(空)"))
+        info("Reality 的 SNI 是伪装域名, 必须选一个真实存在、支持 TLS1.3 的站点")
+        info("常用: apple.com  www.microsoft.com  www.cloudflare.com")
+    elif t == "hysteria":
+        cur = ((ps.get("tls") or {}).get("server_name") or "")
+        print("")
+        info("协议 HY2  当前证书域名: %s" % (cur or "(空)"))
+        info("HY2 用的是本机自签证书, 客户端本来就要跳过证书验证")
+        info("所以这个域名随便填都能连, 换它只是改外观")
+    else:
+        err("只有 VLESS 和 HY2 有 SNI 可改, 这个节点是 %s"
+            % TYPE_CN.get(t, t))
+        return False
+
+    new = ask("新域名 (留空取消)", "")
+    if not new:
+        info("已取消"); return False
+    if not valid_sni(new):
+        err("域名格式不对: %s" % new); return False
+    if new == cur:
+        info("跟当前一样, 不用改"); return False
+
+    if t == "vless":
+        okk, why = probe_tls13(new)
+        if okk is False:
+            err("%s %s -> Reality 用它会连不上" % (new, why))
+            if not confirm("还是要用这个域名", False):
+                info("已取消"); return False
+        elif okk is None:
+            warn("%s %s, 请自行确认" % (new, why))
+        else:
+            ok("%s %s" % (new, why))
+
+    print("")
+    warn("将把 id=%s  %s" % (nid, node.get("name")))
+    info("  SNI  %s  ->  %s" % (cur or "(空)", new))
+    if t == "vless":
+        info("  面板改 reality_settings/tls_settings 的 server_name")
+        info("  本机 config.json 的 CertDomain 同步改, 然后重启 V2bX")
+        info("  Reality 公私钥不变, 客户端只需改 SNI 一项")
+    else:
+        info("  面板改 tls.server_name")
+        info("  本机重新签发自签证书 (CN=%s), config.json 同步, 重启 V2bX" % new)
+    if not confirm("确认修改", False):
+        info("已取消"); return False
+
+    # 1) 面板
+    ps2 = json.loads(json.dumps(ps)) if ps else {}
+    if t == "vless":
+        rs = ps2.get("reality_settings") or {}
+        rs["server_name"] = new
+        ps2["reality_settings"] = rs
+        ts = ps2.get("tls_settings") or {}
+        if ts:
+            ts["server_name"] = new
+            ps2["tls_settings"] = ts
+    else:
+        tl = ps2.get("tls") or {}
+        tl["server_name"] = new
+        ps2["tls"] = tl
+    p = {
+        "id": nid,
+        "name": node.get("name"),
+        "type": node.get("type"),
+        "host": node.get("host"),
+        "port": str(node.get("port")),
+        "server_port": int(node.get("server_port")),
+        "group_ids": node.get("group_ids") or GROUP_IDS,
+        "rate": str(node.get("rate") or "1"),
+        "show": 1 if node.get("show") in (1, True, None) else 0,
+        "tags": node.get("tags") or [],
+        "protocol_settings": ps2,
+    }
+    if node.get("parent_id"):
+        p["parent_id"] = int(node["parent_id"])
+    save_node(p)
+    ok("面板已更新 id=%s" % nid)
+
+    # 2) HY2 重签证书
+    if t == "hysteria":
+        try:
+            global CERT_DOMAIN
+            CERT_DOMAIN = new
+            if os.path.exists(CERT_FILE):
+                backup_file(CERT_FILE)
+                os.remove(CERT_FILE)
+            if os.path.exists(KEY_FILE):
+                os.remove(KEY_FILE)
+            ensure_cert()
+            cfg = load_conf() or {}
+            if cfg:
+                cfg["cert_domain"] = new
+                save_conf(cfg)
+        except Exception as e:
+            err("证书重签失败: %s (面板已改, 本机证书还是旧的)" % e)
+
+    # 3) 本机 config.json
+    try:
+        if local_sni_sync(nid, new):
+            ok("本机 config.json 已同步")
+            restart_v2bx()
+        else:
+            info("本机 config.json 没有这个节点, 只改了面板")
+    except Exception as e:
+        err("本机同步失败: %s" % e)
+    return True
+
 def edit_panel_fields(node):
     """只允许改安全字段. host/port/server_port/protocol_settings 一律不碰"""
     name = ask("名称", node.get("name") or "")
@@ -1992,12 +2186,19 @@ def manage_local(ctx):
                 i, m["id"], TYPE_CN.get(m["type"], m["core_type"]),
                 str(m["name"])[:28], fmt_port(m), tag))
         print("")
-        print(" d) 删除节点    e) 修改节点    回车返回")
-        info("删除会同时处理面板节点和 config.json 条目")
+        info("标签说明: [分割线]=占位节点  [子]=复制出来的子节点")
+        info("          [仅面板]=面板有但本机 config.json 没跑")
+        info("          [面板无此节点]=本机在跑但面板已删  [隐藏]=面板设为不显示")
+        info("          [IP匹配·仅供参考]=只靠出口 IP 猜的, 可能是别的机器")
+        print("")
+        print(" 1) 修改节点 (名称/倍率/分组/显示)")
+        print(" 2) 修改 SNI (VLESS 改 Reality 伪装域名, HY2 改证书域名)")
+        print(" 3) 删除节点 (面板 + config.json 一起处理)")
+        print(" 0) 返回        直接回车也是返回")
         c = ask("选择", "")
-        if not c:
+        if not c or c == "0":
             return
-        if c == "d":
+        if c == "3":
             n = ask_int("要删除的序号", None, 1, len(rel))
             if n is None: continue
             m = rel[n - 1]
@@ -2022,7 +2223,7 @@ def manage_local(ctx):
                 err("删除失败: %s" % e)
             probe(ctx)
             pause()
-        elif c == "e":
+        elif c in ("1", "2"):
             n = ask_int("要修改的序号", None, 1, len(rel))
             if n is None: continue
             m = rel[n - 1]
@@ -2033,11 +2234,18 @@ def manage_local(ctx):
                 err("重新获取节点失败"); pause(); continue
             print("")
             try:
-                if edit_panel_fields(node):
+                if c == "1":
+                    done = edit_panel_fields(node)
+                else:
+                    done = edit_node_sni(node)
+                if done:
+                    ctx["all_nodes"] = get_nodes()
                     probe(ctx)
             except Exception as e:
                 err("保存失败: %s" % e)
             pause()
+        else:
+            err("没有这个选项: %s" % c); pause()
 
 # ==================== 7) 面板节点浏览 ====================
 def browse_panel(ctx):
@@ -2062,7 +2270,7 @@ def browse_panel(ctx):
         line()
         if not show:
             info("没有匹配的节点")
-        for n in show[:60]:
+        for n in show:
             flag = ""
             if n.get("parent_id"):
                 flag += C_B + " [子]" + C_0
@@ -2072,17 +2280,21 @@ def browse_panel(ctx):
                 n.get("id"), TYPE_CN.get(n.get("type"), n.get("type")),
                 str(n.get("name"))[:32], n.get("host"),
                 n.get("server_port"), flag))
-        if len(show) > 60:
-            info("... 还有 %d 个, 用关键字过滤" % (len(show) - 60))
         print("")
-        print(" f) 关键字过滤   e) 按 id 修改   d) 按 id 删除   回车返回")
-        info("只能改 名称/倍率/分组/显示, 地址端口协议一律不动")
+        info("以上是面板全部节点, 已全量列出 (不再截断)")
+        info("标签: [子]=复制出来的子节点   [隐藏]=面板设为不显示")
+        print("")
+        print(" 1) 按 id 修改 (名称/倍率/分组/显示)")
+        print(" 2) 按 id 修改 SNI (VLESS 改 Reality, HY2 改证书域名)")
+        print(" 3) 按 id 删除")
+        print(" 4) 关键字过滤 (可搜 名称/地址/id, 留空清除)")
+        print(" 0) 返回        直接回车也是返回")
         c = ask("选择", "")
-        if not c:
+        if not c or c == "0":
             return
-        if c == "f":
+        if c == "4":
             kw = ask("关键字 (留空清除过滤)", "")
-        elif c == "e":
+        elif c in ("1", "2"):
             i = ask("节点 id", "")
             if not i.isdigit(): continue
             node = node_by_id(nodes, int(i))
@@ -2092,13 +2304,14 @@ def browse_panel(ctx):
             info("%s  %s  %s:%s" % (node.get("name"), node.get("type"),
                                     node.get("host"), node.get("port")))
             try:
-                if edit_panel_fields(node):
+                done = edit_panel_fields(node) if c == "1" else edit_node_sni(node)
+                if done:
                     nodes = get_nodes(); ctx["all_nodes"] = nodes
                     probe(ctx)
             except Exception as e:
                 err("保存失败: %s" % e)
             pause()
-        elif c == "d":
+        elif c == "3":
             i = ask("节点 id", "")
             if not i.isdigit(): continue
             node = node_by_id(nodes, int(i))
@@ -2122,6 +2335,8 @@ def browse_panel(ctx):
             except Exception as e:
                 err("删除失败: %s" % e)
             pause()
+        else:
+            err("没有这个选项: %s" % c); pause()
 
 # ==================== 9) 修复模式 ====================
 def repair(ctx):
