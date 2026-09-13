@@ -23,6 +23,7 @@ v0.7 相比 v0.6:
      完全不含任何删除逻辑, 行为与 v0.6 一致.
   3. 新增菜单 14 新增分割线: 内容交互手填, 只在面板建一条占位, 不动本机.
   4. 修复 payload 缺 route_ids 导致面板编辑页报错 (null.includes)
+     (v0.7.1 补全: 菜单 5 复制节点 / 改 SNI / 编辑面板字段 三处漏网)
 
 v0.6 相比 v0.5:
   1. 节点命名规范定死: 编号-主机名-协议-备注
@@ -2231,6 +2232,7 @@ def copy_node(ctx):
         "rate": str(rate),
         "show": 1,
         "tags": src.get("tags") or [],
+        "route_ids": src.get("route_ids") or [],
         "parent_id": int(src.get("id")),
         "protocol_settings": src.get("protocol_settings") or {},
     }
@@ -2378,6 +2380,7 @@ def edit_node_sni(node):
         "rate": str(node.get("rate") or "1"),
         "show": 1 if node.get("show") in (1, True, None) else 0,
         "tags": node.get("tags") or [],
+        "route_ids": node.get("route_ids") or [],
         "protocol_settings": ps2,
     }
     if node.get("parent_id"):
@@ -2434,6 +2437,7 @@ def edit_panel_fields(node):
         "rate": str(rate),
         "show": 1 if str(sh).strip() != "0" else 0,
         "tags": node.get("tags") or [],
+        "route_ids": node.get("route_ids") or [],
         "protocol_settings": node.get("protocol_settings") or {},
     }
     if node.get("parent_id"):
