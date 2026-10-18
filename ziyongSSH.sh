@@ -274,6 +274,40 @@ set_port(){
   echo -e "${Y}⚠ 勿关闭当前窗口，另开窗口测试成功后再关${N}"
 }
 
+http_get(){
+  # $1=-4/-6/空  $2=URL；优先 curl，没有就用 wget（busybox wget 不支持 -4/-6，只能走默认线路）
+  if command -v curl >/dev/null 2>&1; then curl -fsS $1 --max-time 4 "$2" 2>/dev/null
+  elif [ -z "$1" ] && command -v wget >/dev/null 2>&1; then wget -qO- -T 4 "$2" 2>/dev/null
+  else return 1; fi
+}
+get_ip(){
+  local u ip
+  for u in https://api.ip.sb/ip https://icanhazip.com https://ifconfig.co https://ipinfo.io/ip; do
+    ip=$(http_get "$1" "$u" | tr -d ' \r\n')
+    if [ "$1" = "-6" ]; then [[ "$ip" =~ ^[0-9a-fA-F:]+$ && "$ip" == *:* ]] && { echo "$ip"; return 0; }
+    else [[ "$ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]] && { echo "$ip"; return 0; }; fi
+  done
+  return 1
+}
+ip_geo(){ http_get "" "http://ip-api.com/line/$1?fields=country,regionName,city,isp,as&lang=zh-CN" | tr '\n' ' '; }
+egress_ip(){
+  if ! command -v curl >/dev/null 2>&1; then
+    pkg_install curl || echo -e "${Y}⚠ curl 安装失败，改用 wget（只能查默认线路，不区分 v4/v6）${N}"
+  fi
+  echo -e "${C}查询出口 IP 中...${N}"
+  local v4 v6
+  if command -v curl >/dev/null 2>&1; then
+    v4=$(get_ip -4); v6=$(get_ip -6)
+  else
+    v4=$(get_ip "")
+  fi
+  if [ -n "$v4" ]; then echo -e "   IPv4 出口   : ${G}$v4${N}  ${C}$(ip_geo "$v4")${N}"
+  else echo -e "   IPv4 出口   : ${R}❌ 无${N}"; fi
+  if [ -n "$v6" ]; then echo -e "   IPv6 出口   : ${G}$v6${N}  ${C}$(ip_geo "$v6")${N}"
+  else echo -e "   IPv6 出口   : ${R}❌ 无${N}"; fi
+  [ -n "$v4$v6" ]
+}
+
 status(){
 clear
 echo -e "${R}  自用脚本，擅自使用后果自负${N}"
@@ -293,6 +327,7 @@ echo "   4、仅密钥登录        （再次执行则关闭）"
 echo "   5、修改 SSH 端口"
 echo "   6、修改主机名"
 echo "   7、修改 root 密码"
+echo "   8、查看本机出口 IP"
 echo "   9、注入备用公钥      （再次执行则撤销）"
 echo "   0、退出"
 echo "  ═══════════════════════════════════════════"
@@ -329,6 +364,7 @@ run_op(){
          echo -e "${G}✔ 已改为 $h${N}"
        fi ;;
     7) passwd root ;;
+    8) egress_ip ;;
     9) if has_key2; then key2_del; else key2_add && apply; fi ;;
     0) exit 0 ;;
     *) echo -e "${R}无效选项${N}"; return 1 ;;
