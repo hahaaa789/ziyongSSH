@@ -290,6 +290,7 @@ get_ip(){
   return 1
 }
 ip_geo(){ http_get "" "http://ip-api.com/line/$1?fields=country,regionName,city,isp,as&lang=zh-CN" | tr '\n' ' '; }
+EIP=""  # 出口 IP 显示行，进脚本时查一次，8 号重新查
 egress_ip(){
   if ! command -v curl >/dev/null 2>&1; then
     pkg_install curl || echo -e "${Y}⚠ curl 安装失败，改用 wget（只能查默认线路，不区分 v4/v6）${N}"
@@ -301,10 +302,10 @@ egress_ip(){
   else
     v4=$(get_ip "")
   fi
-  if [ -n "$v4" ]; then echo -e "   IPv4 出口   : ${G}$v4${N}  ${C}$(ip_geo "$v4")${N}"
-  else echo -e "   IPv4 出口   : ${R}❌ 无${N}"; fi
-  if [ -n "$v6" ]; then echo -e "   IPv6 出口   : ${G}$v6${N}  ${C}$(ip_geo "$v6")${N}"
-  else echo -e "   IPv6 出口   : ${R}❌ 无${N}"; fi
+  if [ -n "$v4" ]; then EIP="   IPv4 出口   : ${G}$v4${N}  ${C}$(ip_geo "$v4")${N}"
+  else EIP="   IPv4 出口   : ${R}❌ 无${N}"; fi
+  if [ -n "$v6" ]; then EIP="$EIP\n   IPv6 出口   : ${G}$v6${N}  ${C}$(ip_geo "$v6")${N}"
+  else EIP="$EIP\n   IPv6 出口   : ${R}❌ 无${N}"; fi
   [ -n "$v4$v6" ]
 }
 
@@ -312,6 +313,7 @@ status(){
 clear
 echo -e "${R}  自用脚本，擅自使用后果自负${N}"
 echo "  ═══════════════════════════════════════════"
+[ -n "$EIP" ] && echo -e "$EIP" && echo "  ───────────────────────────────────────────"
 has_key  && echo -e "   公钥注入    : ${G}✅ 已部署${N}" || echo -e "   公钥注入    : ${R}❌ 未部署${N}"
 has_key2 && echo -e "   备用公钥    : ${G}✅ 已部署${N}" || echo -e "   备用公钥    : ${R}❌ 未部署${N}"
 f2b_on   && echo -e "   防爆破      : ${G}✅ 已开启${N} (60s/5次封1分钟)" || echo -e "   防爆破      : ${R}❌ 未开启${N}"
@@ -327,7 +329,7 @@ echo "   4、仅密钥登录        （再次执行则关闭）"
 echo "   5、修改 SSH 端口"
 echo "   6、修改主机名"
 echo "   7、修改 root 密码"
-echo "   8、查看本机出口 IP"
+echo "   8、重新查询出口 IP"
 echo "   9、注入备用公钥      （再次执行则撤销）"
 echo "   0、退出"
 echo "  ═══════════════════════════════════════════"
@@ -364,7 +366,7 @@ run_op(){
          echo -e "${G}✔ 已改为 $h${N}"
        fi ;;
     7) passwd root ;;
-    8) egress_ip ;;
+    8) egress_ip; echo -e "$EIP" ;;
     9) if has_key2; then key2_del; else key2_add && apply; fi ;;
     0) exit 0 ;;
     *) echo -e "${R}无效选项${N}"; return 1 ;;
@@ -384,6 +386,7 @@ if [ -n "$1" ]; then
   exit $rc
 fi
 
+egress_ip
 while true; do
   status
   read -rp "  请选择 [回车=1]: " op
